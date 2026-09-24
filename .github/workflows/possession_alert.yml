@@ -1,0 +1,27 @@
+name: Possession Dominance Alert
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-alert:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        start: [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - run: python flashscore_possession_dominance_alert.py --start ${{ matrix.start }} --limit 100
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
