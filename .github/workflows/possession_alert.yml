@@ -1,8 +1,8 @@
-name: Possession Dominance Alert
+name: Home Dominance + Tennis No-Loss Alert
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 1 * * *"   # 03:00 Africa/Johannesburg (SAST, UTC+2) daily
   workflow_dispatch: {}
 
 jobs:
