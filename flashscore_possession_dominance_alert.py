@@ -451,20 +451,19 @@ class SixtyFiveScoresScraper:
             log.warning(f"Error closing session: {e}")
 
 
-# ---------------- WEAK AWAY TEAM SIGNAL ENGINE ----------------
+# ---------------- UNDER 3.5 GOALS SIGNAL ENGINE ----------------
 #
-# One-directional on purpose: this only ever backs the claim that the
-# AWAY side is weak — the home side is never checked as the weak one.
-# Two things have to both hold: the away side is projected to score
-# 1 goal at most against this specific home defense (not just "fewer
-# than the home side", an absolute ceiling), AND the home side
-# projects a real edge over the away side (so "unlikely to win" isn't
-# just a coin flip going the other way). "Projected" uses the same
-# blended for+against expected-goals estimate this script's earlier
-# signals have used — xG-based when both sides have full xG/xGA data,
-# a raw-goals fallback otherwise — since a team's likely output
-# against a SPECIFIC opponent depends on both that team's own attack
-# and the opponent's own defense, not either alone.
+# Match-level, not team-directional: this asks whether the MATCH as a
+# whole — combined home + away output — is projected low enough to
+# trust "under 3.5 total goals", not which side is stronger. Each
+# side's own projected output against this specific opponent uses the
+# same blended for+against expected-goals estimate this script's
+# earlier signals have used (xG-based when both sides have full
+# xG/xGA data, a raw-goals fallback otherwise); the two are summed
+# into one combined projection, which has to sit meaningfully below
+# 3.5 — not just "any number under 3.5" — before this is trusted,
+# since match-to-match variance means a projection of exactly 3.4 is
+# a coinflip on actually finishing under the line, not a safe call.
 #
 # NOTE ON CONFIDENCE: same disclaimer as every version of this file —
 # every threshold below is a heuristic cutoff, not a measured
@@ -472,34 +471,31 @@ class SixtyFiveScoresScraper:
 
 MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
 
-# The literal claim: away's projected output against this home side
-# has to sit at or below this — "unlikely to score more than 1".
-AWAY_WEAK_MAX_EXPECTED_GOALS = 1.1
+# The market line this signal is actually about.
+UNDER_GOALS_LINE = 3.5
 
-# Sanity check on top of the projection: away's own raw scoring
+# How far below UNDER_GOALS_LINE the combined projection needs to sit
+# before it's trusted — the buffer that turns "technically under" into
+# "comfortably under".
+MAX_EXPECTED_COMBINED_GOALS = 2.6
+
+# Sanity check on top of the projection: each side's own raw scoring
 # average (regardless of opponent) has to independently support being
-# a low-scoring side — a team that normally scores freely projecting
-# low against one tough defense is a different, weaker claim than a
-# team that barely scores at all.
-AWAY_WEAK_MAX_OWN_GOALS = 1.2
-
-# How much of a projected edge the home side needs over the away side
-# for "away unlikely to win" to mean something beyond a marginal call.
-HOME_EDGE_MIN_MARGIN = 0.3
+# a modest-scoring side — two prolific attacks projecting low against
+# each other's specific defense is a weaker claim than two sides that
+# are independently low-scoring in general.
+OWN_GOALS_SANITY_MAX = 1.6
 
 # Corroboration floors — used only in the scoring function below, not
 # the hard gate, so their absence doesn't disqualify a match.
-AWAY_WEAK_MAX_XG = 1.0
-AWAY_WEAK_MAX_SHOTS = 10.0
-AWAY_WEAK_MAX_SOT = 4.0
-AWAY_WEAK_MIN_OWN_CONCEDED = 1.3
+BOTH_DEFENSES_SOLID_MAX_CONCEDED = 1.2
+COMBINED_SHOTS_MODEST_MAX = 22.0
+COMBINED_BIG_CHANCES_MODEST_MAX = 2.5
 
 # Corroboration bar on top of the hard gate. Max achievable is 4.0 (1
-# away's own xG backs up the low-scoring profile + 1 away creates
-# little shot volume + 1 away creates little on target + 1 away's own
-# defense is leaky too, reinforcing "unlikely to win" beyond just not
-# scoring); set at half of that.
-AWAY_WEAK_SCORE_THRESHOLD = 2.0
+# home defense solid + 1 away defense solid + 1 combined shot volume
+# modest + 1 combined big chances modest); set at half of that.
+UNDER_GOALS_SCORE_THRESHOLD = 2.0
 
 
 def _escape_markdown(text):
@@ -538,44 +534,47 @@ def _expected_goals(home, away):
     return expected_home, expected_away, basis
 
 
-def _away_weak_score(away):
+def _under_goals_score(home, away):
     """
     Corroboration score — every factor here is an extra, independent
-    reason the away side's low-scoring, unlikely-to-win profile is
-    genuinely real rather than a one-off projection against this one
-    matchup. All lookups None-safe.
+    reason the low combined projection is genuinely a low-scoring
+    match, not just an artifact of this one blended projection. All
+    lookups None-safe.
     """
     score = 0.0
 
-    away_xg = away.get("avg_xg")
-    if away_xg is not None and away_xg <= AWAY_WEAK_MAX_XG:
-        score += 1
-
-    away_shots = away.get("avg_shots_for")
-    if away_shots is not None and away_shots <= AWAY_WEAK_MAX_SHOTS:
-        score += 1
-
-    away_sot = away.get("avg_sot_for")
-    if away_sot is not None and away_sot <= AWAY_WEAK_MAX_SOT:
+    home_gc = home.get("avg_gc")
+    if home_gc is not None and home_gc <= BOTH_DEFENSES_SOLID_MAX_CONCEDED:
         score += 1
 
     away_gc = away.get("avg_gc")
-    if away_gc is not None and away_gc >= AWAY_WEAK_MIN_OWN_CONCEDED:
+    if away_gc is not None and away_gc <= BOTH_DEFENSES_SOLID_MAX_CONCEDED:
         score += 1
+
+    home_shots = home.get("avg_shots_for")
+    away_shots = away.get("avg_shots_for")
+    if home_shots is not None and away_shots is not None:
+        if (home_shots + away_shots) <= COMBINED_SHOTS_MODEST_MAX:
+            score += 1
+
+    home_bc = home.get("avg_big_chances_for")
+    away_bc = away.get("avg_big_chances_for")
+    if home_bc is not None and away_bc is not None:
+        if (home_bc + away_bc) <= COMBINED_BIG_CHANCES_MODEST_MAX:
+            score += 1
 
     return score
 
 
-def evaluate_weak_away_signal(home, away, home_data, away_data, m_url):
+def evaluate_under_goals_signal(home, away, home_data, away_data, m_url):
     """
-    Returns a Telegram-ready message if the AWAY side projects at most
-    AWAY_WEAK_MAX_EXPECTED_GOALS against this home side (see
-    _expected_goals), away's own raw scoring average independently
-    supports that (AWAY_WEAK_MAX_OWN_GOALS), the home side projects a
-    real edge (HOME_EDGE_MIN_MARGIN), and the away side clears
-    AWAY_WEAK_SCORE_THRESHOLD worth of corroboration (see
-    _away_weak_score) — or None otherwise. One-directional by design:
-    the home side is never checked as the weak one.
+    Returns a Telegram-ready message if the match's combined projected
+    output (see _expected_goals) sits at or below
+    MAX_EXPECTED_COMBINED_GOALS, each side's own raw scoring average
+    independently supports that (OWN_GOALS_SANITY_MAX), and the match
+    clears UNDER_GOALS_SCORE_THRESHOLD worth of corroboration (see
+    _under_goals_score) — or None otherwise. Match-level, not
+    directional — neither side is singled out as "the weak one".
     """
     home = _escape_markdown(home)
     away = _escape_markdown(away)
@@ -589,21 +588,22 @@ def evaluate_weak_away_signal(home, away, home_data, away_data, m_url):
     ):
         return None
 
+    home_g = hs.get("avg_goals")
     away_g = as_.get("avg_goals")
-    if away_g is None or away_g > AWAY_WEAK_MAX_OWN_GOALS:
+    if home_g is None or away_g is None:
+        return None
+    if home_g > OWN_GOALS_SANITY_MAX or away_g > OWN_GOALS_SANITY_MAX:
         return None
 
     expected_home, expected_away, basis = _expected_goals(hs, as_)
+    expected_combined = expected_home + expected_away
 
-    if expected_away > AWAY_WEAK_MAX_EXPECTED_GOALS:
+    if expected_combined > MAX_EXPECTED_COMBINED_GOALS:
         return None
 
-    if (expected_home - expected_away) < HOME_EDGE_MIN_MARGIN:
-        return None
+    score = _under_goals_score(hs, as_)
 
-    score = _away_weak_score(as_)
-
-    if score < AWAY_WEAK_SCORE_THRESHOLD:
+    if score < UNDER_GOALS_SCORE_THRESHOLD:
         return None
 
     # -------------------------------------------------
@@ -612,21 +612,34 @@ def evaluate_weak_away_signal(home, away, home_data, away_data, m_url):
 
     risks = []
 
-    away_xg = as_.get("avg_xg")
+    home_xgot = hs.get("avg_xgot_for")
+    home_xg = hs.get("avg_xg")
+    if home_xgot is not None and home_xg is not None and home_xgot >= home_xg + 0.3:
+        risks.append(
+            f"{home} has been clinical when it does get a chance "
+            f"(xGOT {home_xgot} vs xG {home_xg}) — capable of making a "
+            f"low volume of shots count"
+        )
+
     away_xgot = as_.get("avg_xgot_for")
+    away_xg = as_.get("avg_xg")
     if away_xgot is not None and away_xg is not None and away_xgot >= away_xg + 0.3:
         risks.append(
             f"{away} has been clinical when it does get a chance "
-            f"(xGOT {away_xgot} vs xG {away_xg}) — a low volume of "
-            f"shots doesn't rule out one going in"
+            f"(xGOT {away_xgot} vs xG {away_xg}) — capable of making a "
+            f"low volume of shots count"
         )
 
-    home_gc = hs.get("avg_gc")
-    if home_gc is not None and home_gc >= 1.0:
-        risks.append(
-            f"{home}'s own defense isn't airtight either (GA "
-            f"{home_gc}/match) — some room for {away} to nick a goal"
-        )
+    home_corners = hs.get("avg_corners_for")
+    away_corners = as_.get("avg_corners_for")
+    if home_corners is not None and away_corners is not None:
+        combined_corners = home_corners + away_corners
+        if combined_corners >= 11.0:
+            risks.append(
+                f"Combined corners are fairly high ({combined_corners:.1f}) "
+                f"— set-piece goal risk isn't fully captured by the "
+                f"open-play projection above"
+            )
 
     # -------------------------------------------------
     # MESSAGE
@@ -636,25 +649,27 @@ def evaluate_weak_away_signal(home, away, home_data, away_data, m_url):
         return "N/A" if v is None else str(v)
 
     lines = [
-        f"📉 *{home} vs {away}*",
+        f"🔒 *{home} vs {away}*",
         "",
-        f"🎯 *Prediction: {away} (away) unlikely to win, and unlikely "
-        f"to score more than 1 goal*",
-        f"Projected {home} ~{expected_home:.2f} vs {away} "
-        f"~{expected_away:.2f} ({basis}) | corroboration score "
-        f"{score:.1f} (bar: {AWAY_WEAK_SCORE_THRESHOLD:.1f})",
+        f"🎯 *Prediction: Under {UNDER_GOALS_LINE} total goals*",
+        f"Projected combined ~{expected_combined:.2f} "
+        f"({home} ~{expected_home:.2f} + {away} ~{expected_away:.2f}, "
+        f"{basis}) | corroboration score {score:.1f} "
+        f"(bar: {UNDER_GOALS_SCORE_THRESHOLD:.1f})",
         "",
         "📊 *Stats*",
-        f"{away} (away)   G {fmt(as_.get('avg_goals'))} | "
-        f"GA {fmt(as_.get('avg_gc'))} | "
-        f"xG {fmt(as_.get('avg_xg'))} | "
-        f"Shots {fmt(as_.get('avg_shots_for'))} | "
-        f"SoT {fmt(as_.get('avg_sot_for'))}",
-        f"{home} (home)   G {fmt(hs.get('avg_goals'))} | "
+        f"{home}   G {fmt(hs.get('avg_goals'))} | "
         f"GA {fmt(hs.get('avg_gc'))} | "
         f"xG {fmt(hs.get('avg_xg'))} | "
+        f"xGA {fmt(hs.get('avg_xga'))} | "
         f"Shots {fmt(hs.get('avg_shots_for'))} | "
-        f"SoT {fmt(hs.get('avg_sot_for'))}",
+        f"BigCh {fmt(hs.get('avg_big_chances_for'))}",
+        f"{away}   G {fmt(as_.get('avg_goals'))} | "
+        f"GA {fmt(as_.get('avg_gc'))} | "
+        f"xG {fmt(as_.get('avg_xg'))} | "
+        f"xGA {fmt(as_.get('avg_xga'))} | "
+        f"Shots {fmt(as_.get('avg_shots_for'))} | "
+        f"BigCh {fmt(as_.get('avg_big_chances_for'))}",
         "",
     ]
 
@@ -666,7 +681,6 @@ def evaluate_weak_away_signal(home, away, home_data, away_data, m_url):
     lines.append(f"🔗 {m_url}")
 
     return "\n".join(lines)
-
 
 
 # ---------------- ALERT SCRIPT ----------------
@@ -711,13 +725,13 @@ def main():
         return
 
     send_job_status(
-        f"🚀 Job STARTED (soccer weak-away-team alert)\n"
+        f"🚀 Job STARTED (soccer under-3.5-goals alert)\n"
         f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
     )
 
-    log.info("Starting 365scores weak-away-team alert script...")
+    log.info("Starting 365scores under-3.5-goals alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     scraper = None
@@ -748,7 +762,7 @@ def main():
             log.info("No matches in this batch.")
 
             send_job_status(
-                f"⚠️ Weak-away-team alert FINISHED (No matches)\n"
+                f"⚠️ Under-3.5-goals alert FINISHED (No matches)\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, 0 fell in this "
                 f"batch's range",
@@ -815,7 +829,7 @@ def main():
 
                     analyzed_count += 1
 
-                    weak_away_msg = evaluate_weak_away_signal(
+                    under_goals_msg = evaluate_under_goals_signal(
                         home,
                         away,
                         home_data,
@@ -823,15 +837,15 @@ def main():
                         m_url
                     )
 
-                    if weak_away_msg:
-                        log.info("ALERT (weak away team):\n" + weak_away_msg)
+                    if under_goals_msg:
+                        log.info("ALERT (under 3.5 goals):\n" + under_goals_msg)
                         scraper.send_telegram_message(
-                            weak_away_msg,
+                            under_goals_msg,
                             BOT_TOKEN,
                             CHAT_ID
                         )
                     else:
-                        log.info("No weak-away-team signal found.")
+                        log.info("No under-3.5-goals signal found.")
 
                 except Exception as match_err:
                     log.error(
@@ -846,7 +860,7 @@ def main():
             )
 
             send_job_status(
-                f"✅ Weak-away-team alert FINISHED\n"
+                f"✅ Under-3.5-goals alert FINISHED\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, analyzed "
                 f"{analyzed_count}/{len(batch_matches)} in this batch",
@@ -856,11 +870,11 @@ def main():
 
     except Exception as e:
 
-        log.error(f"Weak-away-team alert job failed: {e}")
+        log.error(f"Under-3.5-goals alert job failed: {e}")
         log.error(traceback.format_exc())
 
         send_job_status(
-            f"❌ Weak-away-team alert FAILED\n"
+            f"❌ Under-3.5-goals alert FAILED\n"
             f"Batch START={START} LIMIT={LIMIT}\n"
             f"Found {len(matches)} matches today, analyzed "
             f"{analyzed_count} before failing\n"
