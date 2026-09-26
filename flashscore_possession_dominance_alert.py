@@ -1031,19 +1031,21 @@ class TennisScraper:
             log.warning(f"Error closing session: {e}")
 
 
-# ---------------- POSSESSION DOMINANCE SIGNAL ENGINE ----------------
+# ---------------- SHOTS DOMINANCE SIGNAL ENGINE ----------------
 #
-# The previous "match winner for every match" predictor has been
-# removed. This is back to a gated filter, focused on one specific
-# claim: one team both DOMINATES the ball AND turns that dominance
-# into real chance creation against this specific opponent — not just
-# sterile, side-to-side possession with nothing to show for it.
-# That's deliberately two separate requirements, not one: possession
-# share alone says nothing about end product (a team can have 65% of
-# the ball and create less than a team happy to sit deep and counter),
-# so the hard gate requires BOTH a clear possession gap AND that team
-# actually out-creating the opponent on shots, shots on target, and
-# big chances.
+# Possession is no longer the focal stat here — it's been demoted to
+# one corroborating factor among several. The hard gate is now built
+# on shot volume AND shot accuracy together: one specific claim, one
+# team is generating both significantly MORE shots and significantly
+# MORE shots on target than this specific opponent, each past its own
+# absolute floor as well as a gap over the opponent — not just "more
+# of the same speculative efforts", but more shots that are also more
+# often actually on target. That's deliberately two separate
+# requirements, not one: a team can lead on raw shot count while
+# spraying most of them wide, so total shots alone doesn't prove
+# attacking dominance without shots on target backing it up, and vice
+# versa (a team parking the bus can occasionally out-accuracy a side
+# that dominates volume).
 #
 # NOTE ON CONFIDENCE: same disclaimer as every version of this file —
 # every threshold below is a heuristic cutoff, not a measured
@@ -1051,32 +1053,35 @@ class TennisScraper:
 
 MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
 
-# What counts as "dominates possession": a high own-average floor,
-# AND a wide gap over the opponent's own average — a team on 56%
-# against an opponent on 54% isn't "dominant", it's a coin flip.
-POSSESSION_DOMINANT_MIN = 56.0
-POSSESSION_GAP_MIN = 10.0
+# What counts as "dominates shot volume": a high own-average floor,
+# AND a wide gap over the opponent's own average — a team on 12
+# shots/match against an opponent on 11 isn't "dominant", it's noise.
+SHOTS_DOMINANT_MIN = 12.0
+SHOTS_GAP_MIN = 5.0
+
+# Same two-part shape, applied to shots ON TARGET specifically — the
+# accuracy half of the claim, not just raw attempts.
+SOT_DOMINANT_MIN = 4.5
+SOT_GAP_MIN = 2.0
 
 # How much of an xG edge on top of the raw shot-count edge counts as
-# "the extra chances are genuinely better quality, not just more of
-# the same speculative efforts".
+# "the extra shots are genuinely better quality, not just more of the
+# same speculative efforts".
 XG_QUALITY_EDGE_MIN = 0.5
 
-# Corroboration bar on top of the hard gate (possession dominance +
-# out-creating the opponent on shots/SoT/big chances). Max achievable
-# is 5.0 (1 xG quality edge + 1 more corners/territory + 1 own defense
-# solid enough that dominating the ball also means limiting counters +
-# 1 opponent genuinely starved for shots + 1 healthy volume of big
-# chances, not just more than a weak opponent); set at 60% of that.
-POSSESSION_SCORE_THRESHOLD = 3.0
+# Corroboration bar on top of the hard gate (shot volume + shot
+# accuracy dominance). Max achievable is 5.0 (1 xG quality edge + 1
+# more big chances created + 1 also ahead on possession — now just
+# corroboration, not required + 1 own defense solid enough that
+# dominating shots also means limiting counters + 1 opponent
+# genuinely starved for shots); set at 60% of that.
+SHOTS_SCORE_THRESHOLD = 3.0
 
-# "Genuinely starved" / "healthy volume" absolute bars, used alongside
-# the relative comparisons in the hard gate — an opponent having fewer
-# shots than the dominant side still matters less if they're both
-# generating plenty; these check the actual numbers, not just who's
-# ahead.
+# "Genuinely starved" absolute bar, used alongside the relative
+# comparison in the hard gate — an opponent having fewer shots than
+# the dominant side still matters less if they're both generating
+# plenty; this checks the actual number, not just who's ahead.
 OPPONENT_STARVED_MAX_SHOTS = 9.0
-HEALTHY_BIG_CHANCES_MIN = 1.8
 
 
 def _escape_markdown(text):
@@ -1089,44 +1094,49 @@ def _escape_markdown(text):
     return re.sub(r"([_*`\[])", r"\\\1", str(text))
 
 
-def _dominates_possession_and_chances(team, opp):
+def _dominates_shots_and_accuracy(team, opp):
     """
-    Hard gate: True only if `team` both dominates the ball against
-    `opp` (POSSESSION_DOMINANT_MIN / POSSESSION_GAP_MIN) AND converts
-    that into more shots, more shots on target, and more big chances
-    than `opp` — all three, no partial credit, since the whole point
-    of this filter is possession that actually produces something.
-    xG is deliberately NOT part of this hard gate (folded into the
-    corroboration score instead) so a minor-league match missing xG
-    data can still qualify on the raw counting stats. Fails closed on
-    any missing input.
+    Hard gate: True only if `team` dominates BOTH total shots
+    (SHOTS_DOMINANT_MIN / SHOTS_GAP_MIN) AND shots on target
+    (SOT_DOMINANT_MIN / SOT_GAP_MIN) against `opp` — both stats, no
+    partial credit, since the whole point of this filter is shot
+    output that's genuinely both heavy AND accurate, not one without
+    the other. xG is deliberately NOT part of this hard gate (folded
+    into the corroboration score instead) so a minor-league match
+    missing xG data can still qualify on the raw counting stats. Fails
+    closed on any missing input.
     """
-    team_poss, opp_poss = team.get("avg_possession"), opp.get("avg_possession")
-    if team_poss is None or opp_poss is None:
-        return False
-
-    if team_poss < POSSESSION_DOMINANT_MIN:
-        return False
-
-    if team_poss - opp_poss < POSSESSION_GAP_MIN:
-        return False
-
     team_shots, opp_shots = team.get("avg_shots_for"), opp.get("avg_shots_for")
-    team_sot, opp_sot = team.get("avg_sot_for"), opp.get("avg_sot_for")
-    team_bc, opp_bc = team.get("avg_big_chances_for"), opp.get("avg_big_chances_for")
-
-    if None in (team_shots, opp_shots, team_sot, opp_sot, team_bc, opp_bc):
+    if team_shots is None or opp_shots is None:
         return False
 
-    return team_shots > opp_shots and team_sot > opp_sot and team_bc > opp_bc
+    if team_shots < SHOTS_DOMINANT_MIN:
+        return False
+
+    if team_shots - opp_shots < SHOTS_GAP_MIN:
+        return False
+
+    team_sot, opp_sot = team.get("avg_sot_for"), opp.get("avg_sot_for")
+    if team_sot is None or opp_sot is None:
+        return False
+
+    if team_sot < SOT_DOMINANT_MIN:
+        return False
+
+    if team_sot - opp_sot < SOT_GAP_MIN:
+        return False
+
+    return True
 
 
-def _possession_dominance_score(team, opp):
+def _shots_dominance_score(team, opp):
     """
     Corroboration score on top of the hard gate — every factor here is
-    an extra, independent reason the possession dominance is
-    genuinely meaningful rather than just "more touches, marginally
-    more shots". All lookups None-safe.
+    an extra, independent reason the shot dominance is genuinely
+    meaningful rather than just a high-volume, low-quality barrage.
+    Possession lives here now, not in the hard gate — a corroborating
+    signal that the shot dominance comes with genuine territorial
+    control, not just a scattergun approach. All lookups None-safe.
     """
     score = 0.0
 
@@ -1134,8 +1144,12 @@ def _possession_dominance_score(team, opp):
     if team_xg is not None and opp_xg is not None and team_xg - opp_xg >= XG_QUALITY_EDGE_MIN:
         score += 1
 
-    team_corners, opp_corners = team.get("avg_corners_for"), opp.get("avg_corners_for")
-    if team_corners is not None and opp_corners is not None and team_corners > opp_corners:
+    team_bc, opp_bc = team.get("avg_big_chances_for"), opp.get("avg_big_chances_for")
+    if team_bc is not None and opp_bc is not None and team_bc > opp_bc:
+        score += 1
+
+    team_poss, opp_poss = team.get("avg_possession"), opp.get("avg_possession")
+    if team_poss is not None and opp_poss is not None and team_poss > opp_poss:
         score += 1
 
     team_gc = team.get("avg_gc", 0)
@@ -1146,22 +1160,18 @@ def _possession_dominance_score(team, opp):
     if opp_shots is not None and opp_shots <= OPPONENT_STARVED_MAX_SHOTS:
         score += 1
 
-    team_bc = team.get("avg_big_chances_for")
-    if team_bc is not None and team_bc >= HEALTHY_BIG_CHANCES_MIN:
-        score += 1
-
     return score
 
 
-def evaluate_possession_dominance_signal(home, away, home_data, away_data, m_url):
+def evaluate_shots_dominance_signal(home, away, home_data, away_data, m_url):
     """
-    Returns a Telegram-ready message if either side both dominates
-    possession against the other AND out-creates them on shots/SoT/big
-    chances (see _dominates_possession_and_chances), and clears
-    POSSESSION_SCORE_THRESHOLD worth of corroboration (see
-    _possession_dominance_score) — or None if neither direction clears
-    both bars. Single bidirectional function via the `dominance_case`
-    closure, same pattern this file's earlier signals used.
+    Returns a Telegram-ready message if either side dominates BOTH
+    total shots and shots on target against the other (see
+    _dominates_shots_and_accuracy), and clears SHOTS_SCORE_THRESHOLD
+    worth of corroboration (see _shots_dominance_score) — or None if
+    neither direction clears both bars. Single bidirectional function
+    via the `dominance_case` closure, same pattern this file's earlier
+    signals used.
     """
     home = _escape_markdown(home)
     away = _escape_markdown(away)
@@ -1176,12 +1186,12 @@ def evaluate_possession_dominance_signal(home, away, home_data, away_data, m_url
         return None
 
     def dominance_case(team_stats, opp_stats):
-        if not _dominates_possession_and_chances(team_stats, opp_stats):
+        if not _dominates_shots_and_accuracy(team_stats, opp_stats):
             return None
 
-        score = _possession_dominance_score(team_stats, opp_stats)
+        score = _shots_dominance_score(team_stats, opp_stats)
 
-        if score < POSSESSION_SCORE_THRESHOLD:
+        if score < SHOTS_SCORE_THRESHOLD:
             return None
 
         return score
@@ -1215,7 +1225,7 @@ def evaluate_possession_dominance_signal(home, away, home_data, away_data, m_url
     if team_xg is not None and team_g <= team_xg - 0.3:
         risks.append(
             f"{team_name} has been under-converting its own chance "
-            f"quality (goals {team_g} vs xG {team_xg}) — the "
+            f"quality (goals {team_g} vs xG {team_xg}) — the shot "
             f"dominance is real, but it isn't always turning into "
             f"goals"
         )
@@ -1225,16 +1235,16 @@ def evaluate_possession_dominance_signal(home, away, home_data, away_data, m_url
     if team_shots_against is not None and team_shots_against >= 10.0:
         risks.append(
             f"{team_name} still concedes {team_shots_against} "
-            f"shots/match despite dominating the ball — some "
+            f"shots/match despite out-shooting {opp_name} — some "
             f"counter-attack exposure even while in control"
         )
 
     opp_xg = opp_stats.get("avg_xg")
     if opp_xg is not None and opp_xg >= 1.0:
         risks.append(
-            f"{opp_name} still averages {opp_xg} xG/match even with "
-            f"the ball taken off them — capable of making the few "
-            f"chances they get count"
+            f"{opp_name} still averages {opp_xg} xG/match despite the "
+            f"shot deficit — capable of making the few chances they "
+            f"get count"
         )
 
     # -------------------------------------------------
@@ -1245,24 +1255,26 @@ def evaluate_possession_dominance_signal(home, away, home_data, away_data, m_url
         return "N/A" if v is None else str(v)
 
     lines = [
-        f"🔵 *{home} vs {away}*",
+        f"🎯 *{home} vs {away}*",
         "",
-        f"🎯 *Prediction: {team_name} to dominate possession and "
-        f"control chance creation against {opp_name}*",
-        f"Possession {fmt(team_stats.get('avg_possession'))}% vs "
-        f"{fmt(opp_stats.get('avg_possession'))}% | corroboration "
-        f"score {score:.1f} (bar: {POSSESSION_SCORE_THRESHOLD:.1f})",
+        f"🎯 *Prediction: {team_name} to dominate shots and shot "
+        f"accuracy against {opp_name}*",
+        f"Shots {fmt(team_stats.get('avg_shots_for'))} vs "
+        f"{fmt(opp_stats.get('avg_shots_for'))} | SoT "
+        f"{fmt(team_stats.get('avg_sot_for'))} vs "
+        f"{fmt(opp_stats.get('avg_sot_for'))} | corroboration "
+        f"score {score:.1f} (bar: {SHOTS_SCORE_THRESHOLD:.1f})",
         "",
         "📊 *Stats*",
-        f"{team_name}   Poss {fmt(team_stats.get('avg_possession'))}% | "
-        f"Shots {fmt(team_stats.get('avg_shots_for'))} | "
+        f"{team_name}   Shots {fmt(team_stats.get('avg_shots_for'))} | "
         f"SoT {fmt(team_stats.get('avg_sot_for'))} | "
         f"BigCh {fmt(team_stats.get('avg_big_chances_for'))} | "
+        f"Poss {fmt(team_stats.get('avg_possession'))}% | "
         f"xG {fmt(team_stats.get('avg_xg'))}",
-        f"{opp_name}   Poss {fmt(opp_stats.get('avg_possession'))}% | "
-        f"Shots {fmt(opp_stats.get('avg_shots_for'))} | "
+        f"{opp_name}   Shots {fmt(opp_stats.get('avg_shots_for'))} | "
         f"SoT {fmt(opp_stats.get('avg_sot_for'))} | "
         f"BigCh {fmt(opp_stats.get('avg_big_chances_for'))} | "
+        f"Poss {fmt(opp_stats.get('avg_possession'))}% | "
         f"xG {fmt(opp_stats.get('avg_xg'))}",
         f"Corners {fmt(team_stats.get('avg_corners_for'))} vs "
         f"{fmt(opp_stats.get('avg_corners_for'))} | "
@@ -1585,13 +1597,13 @@ def main():
         return
 
     send_job_status(
-        f"🚀 Job STARTED (soccer possession-dominance + tennis no-loss alert)\n"
+        f"🚀 Job STARTED (soccer shots-dominance + tennis no-loss alert)\n"
         f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
     )
 
-    log.info("Starting 365scores possession-dominance alert script...")
+    log.info("Starting 365scores shots-dominance alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     scraper = None
@@ -1622,7 +1634,7 @@ def main():
             log.info("No matches in this batch.")
 
             send_job_status(
-                f"⚠️ Possession-dominance alert FINISHED (No matches)\n"
+                f"⚠️ Shots-dominance alert FINISHED (No matches)\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, 0 fell in this "
                 f"batch's range",
@@ -1689,7 +1701,7 @@ def main():
 
                     analyzed_count += 1
 
-                    dominance_msg = evaluate_possession_dominance_signal(
+                    dominance_msg = evaluate_shots_dominance_signal(
                         home,
                         away,
                         home_data,
@@ -1698,14 +1710,14 @@ def main():
                     )
 
                     if dominance_msg:
-                        log.info("ALERT (possession dominance):\n" + dominance_msg)
+                        log.info("ALERT (shots dominance):\n" + dominance_msg)
                         scraper.send_telegram_message(
                             dominance_msg,
                             BOT_TOKEN,
                             CHAT_ID
                         )
                     else:
-                        log.info("No possession-dominance signal found.")
+                        log.info("No shots-dominance signal found.")
 
                 except Exception as match_err:
                     log.error(
@@ -1720,7 +1732,7 @@ def main():
             )
 
             send_job_status(
-                f"✅ Possession-dominance alert FINISHED\n"
+                f"✅ Shots-dominance alert FINISHED\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, analyzed "
                 f"{analyzed_count}/{len(batch_matches)} in this batch",
@@ -1730,11 +1742,11 @@ def main():
 
     except Exception as e:
 
-        log.error(f"Possession-dominance alert job failed: {e}")
+        log.error(f"Shots-dominance alert job failed: {e}")
         log.error(traceback.format_exc())
 
         send_job_status(
-            f"❌ Possession-dominance alert FAILED\n"
+            f"❌ Shots-dominance alert FAILED\n"
             f"Batch START={START} LIMIT={LIMIT}\n"
             f"Found {len(matches)} matches today, analyzed "
             f"{analyzed_count} before failing\n"
