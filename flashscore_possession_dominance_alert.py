@@ -1031,35 +1031,36 @@ class TennisScraper:
             log.warning(f"Error closing session: {e}")
 
 
-# ---------------- DOMINANCE RATIO SIGNAL ENGINE ----------------
+# ---------------- HOME DOMINANCE SIGNAL ENGINE ----------------
 #
-# No single stat is the focus here anymore (not possession, not
-# shots, not shots on target) — this asks one plain question: is one
-# team's overall expected scoring output at least DOMINANCE_RATIO
-# times the other's? "Expected output" is the same blended for+against
-# expected-goals figure this script's earlier margin/no-loss signals
-# used (each side's own attacking rate blended with the opponent's own
-# defensive leakiness, xG-based when both sides have full xG/xGA data,
-# a raw-goals fallback otherwise) — not picking one flashy counting
-# stat, but the one number that already folds a team's attack AND the
-# opponent's defense together. A ratio (not a flat point gap) is what
-# makes "75% better" a meaningful, scale-independent claim: it reads
-# the same whether the matchup is high-scoring or low-scoring.
+# One-directional on purpose: this only ever backs the HOME side, not
+# "whichever side is better" — the away side is never checked as the
+# favourite here. The claim itself is simple and absolute: the home
+# team has to be AHEAD OF the away team on every single department
+# this scraper tracks (goals, defense, shots, shots on target, big
+# chances for/against, corners, possession, and xG/xGA when both sides
+# have it) — no partial credit, no corroboration score, no ratio math.
+# One stat going the other way and it doesn't fire.
 #
 # NOTE ON CONFIDENCE: same disclaimer as every version of this file —
-# this is a heuristic cutoff on a blended estimate, not a measured
-# probability.
+# "better in every department" is a heuristic read of the raw
+# averages, not a measured probability.
 
 MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
 
-# The literal claim: one side's expected output must be at least this
-# many times the other's. 1.75 = "75% better".
-DOMINANCE_RATIO = 1.75
-
-# A ratio against a near-zero expected output is meaningless (could
-# read as "infinitely better" over noise) — the weaker side's expected
-# output has to clear this floor before the ratio is trusted at all.
-MIN_EXPECTED_OPPONENT_OUTPUT = 0.2
+# Every department the home team must win outright against the away
+# team's own average — (stat key, "gt" home must be higher / "lt"
+# home must be lower).
+DEPARTMENTS = [
+    ("avg_goals", "gt"),
+    ("avg_gc", "lt"),
+    ("avg_shots_for", "gt"),
+    ("avg_sot_for", "gt"),
+    ("avg_big_chances_for", "gt"),
+    ("avg_big_chances_against", "lt"),
+    ("avg_corners_for", "gt"),
+    ("avg_possession", "gt"),
+]
 
 
 def _escape_markdown(text):
@@ -1072,44 +1073,43 @@ def _escape_markdown(text):
     return re.sub(r"([_*`\[])", r"\\\1", str(text))
 
 
-def _expected_goals(team, opp):
+def _home_better_in_every_department(home, away):
     """
-    Blended for+against expected-goals estimate: xG-based when both
-    sides have full xG/xGA data, a raw-goals fallback otherwise.
-    Returns (expected_team_goals, expected_opp_goals, basis). Same
-    approach this script's earlier margin/no-loss signals used —
-    reused here as the one number that already combines a team's own
-    attacking rate with the specific opponent's own defensive
-    leakiness, rather than reading either side's stats in isolation.
+    True only if the home side is ahead of the away side on every
+    single entry in DEPARTMENTS, AND on xG/xGA too whenever both sides
+    have that data (skipped, not required, only when genuinely missing
+    — common on minor-league matches). Fails closed on any missing
+    department stat DEPARTMENTS itself requires — a stat that can't be
+    compared can't corroborate "better in every department".
     """
-    team_xg, opp_xg = team.get("avg_xg"), opp.get("avg_xg")
-    team_xga, opp_xga = team.get("avg_xga"), opp.get("avg_xga")
+    for key, op in DEPARTMENTS:
+        h_val = home.get(key)
+        a_val = away.get(key)
+        if h_val is None or a_val is None:
+            return False
+        if op == "gt" and not (h_val > a_val):
+            return False
+        if op == "lt" and not (h_val < a_val):
+            return False
 
-    if None not in (team_xg, opp_xg, team_xga, opp_xga):
-        expected_team = (team_xg + opp_xga) / 2
-        expected_opp = (opp_xg + team_xga) / 2
-        basis = "xG-based"
-    else:
-        team_g, opp_g = team.get("avg_goals", 0), opp.get("avg_goals", 0)
-        team_gc, opp_gc = team.get("avg_gc", 0), opp.get("avg_gc", 0)
-        expected_team = (team_g + opp_gc) / 2
-        expected_opp = (opp_g + team_gc) / 2
-        basis = "goals-based, no xG data"
+    h_xg, a_xg = home.get("avg_xg"), away.get("avg_xg")
+    h_xga, a_xga = home.get("avg_xga"), away.get("avg_xga")
 
-    return expected_team, expected_opp, basis
+    if h_xg is not None and a_xg is not None and not (h_xg > a_xg):
+        return False
+
+    if h_xga is not None and a_xga is not None and not (h_xga < a_xga):
+        return False
+
+    return True
 
 
-def evaluate_dominance_ratio_signal(home, away, home_data, away_data, m_url):
+def evaluate_home_dominance_signal(home, away, home_data, away_data, m_url):
     """
-    Returns a Telegram-ready message if either side's expected scoring
-    output (see _expected_goals) is at least DOMINANCE_RATIO times the
-    other's, with the weaker side's own expected output clearing
-    MIN_EXPECTED_OPPONENT_OUTPUT first (see that constant's comment) —
-    or None if neither direction clears the bar. Single bidirectional
-    function via the `dominance_case` closure, same pattern this
-    file's earlier signals used. The full stat breakdown is still
-    shown in the message for reference even though nothing here gates
-    on any one of those stats individually.
+    Returns a Telegram-ready message if the HOME side is ahead of the
+    away side in every tracked department (see
+    _home_better_in_every_department), or None otherwise. Away teams
+    are never backed by this signal — home-only, by design.
     """
     home = _escape_markdown(home)
     away = _escape_markdown(away)
@@ -1123,35 +1123,8 @@ def evaluate_dominance_ratio_signal(home, away, home_data, away_data, m_url):
     ):
         return None
 
-    def dominance_case(team_stats, opp_stats):
-        expected_team, expected_opp, basis = _expected_goals(team_stats, opp_stats)
-
-        if expected_opp < MIN_EXPECTED_OPPONENT_OUTPUT:
-            return None
-
-        if expected_team < DOMINANCE_RATIO * expected_opp:
-            return None
-
-        pct_better = (expected_team / expected_opp - 1) * 100
-        return expected_team, expected_opp, basis, pct_better
-
-    result = None
-    team_stats, opp_stats, team_name, opp_name = None, None, None, None
-
-    home_result = dominance_case(hs, as_)
-    if home_result is not None:
-        result = home_result
-        team_stats, opp_stats, team_name, opp_name = hs, as_, home, away
-    else:
-        away_result = dominance_case(as_, hs)
-        if away_result is not None:
-            result = away_result
-            team_stats, opp_stats, team_name, opp_name = as_, hs, away, home
-
-    if result is None:
+    if not _home_better_in_every_department(hs, as_):
         return None
-
-    expected_team, expected_opp, basis, pct_better = result
 
     # -------------------------------------------------
     # RISK FACTORS (shown, don't block the prediction)
@@ -1159,21 +1132,21 @@ def evaluate_dominance_ratio_signal(home, away, home_data, away_data, m_url):
 
     risks = []
 
-    team_xg = team_stats.get("avg_xg")
-    team_g = team_stats.get("avg_goals", 0)
-    if team_xg is not None and team_g >= team_xg + 1.0:
+    h_xg = hs.get("avg_xg")
+    h_g = hs.get("avg_goals", 0)
+    if h_xg is not None and h_g >= h_xg + 1.0:
         risks.append(
-            f"{team_name} has been scoring above its own underlying "
-            f"chance quality (goals {team_g} vs xG {team_xg}) — some "
-            f"regression toward the mean is possible"
+            f"{home} has been scoring above its own underlying chance "
+            f"quality (goals {h_g} vs xG {h_xg}) — some regression "
+            f"toward the mean is possible"
         )
 
-    opp_xg = opp_stats.get("avg_xg")
-    if opp_xg is not None and opp_xg >= 1.0:
+    a_xg = as_.get("avg_xg")
+    if a_xg is not None and a_xg >= 1.0:
         risks.append(
-            f"{opp_name} still averages {opp_xg} xG/match despite "
-            f"projecting well behind here — capable of making the few "
-            f"chances they get count"
+            f"{away} still averages {a_xg} xG/match despite trailing "
+            f"in every department — capable of making the few chances "
+            f"they get count"
         )
 
     # -------------------------------------------------
@@ -1184,30 +1157,29 @@ def evaluate_dominance_ratio_signal(home, away, home_data, away_data, m_url):
         return "N/A" if v is None else str(v)
 
     lines = [
-        f"📈 *{home} vs {away}*",
+        f"🏠 *{home} vs {away}*",
         "",
-        f"🎯 *Prediction: {team_name} projects at least "
-        f"{(DOMINANCE_RATIO - 1) * 100:.0f}% stronger than {opp_name} "
-        f"right now*",
-        f"Expected output {team_name} ~{expected_team:.2f} vs "
-        f"{opp_name} ~{expected_opp:.2f} ({basis}) — "
-        f"{pct_better:.0f}% higher",
+        f"🎯 *Prediction: {home} (home) is better than {away} in "
+        f"every department*",
         "",
-        "📊 *Stats (for reference)*",
-        f"{team_name}   G {fmt(team_stats.get('avg_goals'))} | "
-        f"GA {fmt(team_stats.get('avg_gc'))} | "
-        f"xG {fmt(team_stats.get('avg_xg'))} | "
-        f"xGA {fmt(team_stats.get('avg_xga'))} | "
-        f"Shots {fmt(team_stats.get('avg_shots_for'))} | "
-        f"SoT {fmt(team_stats.get('avg_sot_for'))} | "
-        f"Poss {fmt(team_stats.get('avg_possession'))}%",
-        f"{opp_name}   G {fmt(opp_stats.get('avg_goals'))} | "
-        f"GA {fmt(opp_stats.get('avg_gc'))} | "
-        f"xG {fmt(opp_stats.get('avg_xg'))} | "
-        f"xGA {fmt(opp_stats.get('avg_xga'))} | "
-        f"Shots {fmt(opp_stats.get('avg_shots_for'))} | "
-        f"SoT {fmt(opp_stats.get('avg_sot_for'))} | "
-        f"Poss {fmt(opp_stats.get('avg_possession'))}%",
+        "📊 *Stats*",
+        f"{home}   G {fmt(hs.get('avg_goals'))} | "
+        f"GA {fmt(hs.get('avg_gc'))} | "
+        f"xG {fmt(hs.get('avg_xg'))} | "
+        f"xGA {fmt(hs.get('avg_xga'))} | "
+        f"Shots {fmt(hs.get('avg_shots_for'))} | "
+        f"SoT {fmt(hs.get('avg_sot_for'))} | "
+        f"Poss {fmt(hs.get('avg_possession'))}%",
+        f"{away}   G {fmt(as_.get('avg_goals'))} | "
+        f"GA {fmt(as_.get('avg_gc'))} | "
+        f"xG {fmt(as_.get('avg_xg'))} | "
+        f"xGA {fmt(as_.get('avg_xga'))} | "
+        f"Shots {fmt(as_.get('avg_shots_for'))} | "
+        f"SoT {fmt(as_.get('avg_sot_for'))} | "
+        f"Poss {fmt(as_.get('avg_possession'))}%",
+        f"BigCh {fmt(hs.get('avg_big_chances_for'))}/{fmt(hs.get('avg_big_chances_against'))} vs "
+        f"{fmt(as_.get('avg_big_chances_for'))}/{fmt(as_.get('avg_big_chances_against'))} | "
+        f"Corners {fmt(hs.get('avg_corners_for'))} vs {fmt(as_.get('avg_corners_for'))}",
         "",
     ]
 
@@ -1523,13 +1495,13 @@ def main():
         return
 
     send_job_status(
-        f"🚀 Job STARTED (soccer dominance-ratio + tennis no-loss alert)\n"
+        f"🚀 Job STARTED (soccer home-dominance + tennis no-loss alert)\n"
         f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
     )
 
-    log.info("Starting 365scores dominance-ratio alert script...")
+    log.info("Starting 365scores home-dominance alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     scraper = None
@@ -1560,7 +1532,7 @@ def main():
             log.info("No matches in this batch.")
 
             send_job_status(
-                f"⚠️ Dominance-ratio alert FINISHED (No matches)\n"
+                f"⚠️ Home-dominance alert FINISHED (No matches)\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, 0 fell in this "
                 f"batch's range",
@@ -1627,7 +1599,7 @@ def main():
 
                     analyzed_count += 1
 
-                    dominance_msg = evaluate_dominance_ratio_signal(
+                    dominance_msg = evaluate_home_dominance_signal(
                         home,
                         away,
                         home_data,
@@ -1636,14 +1608,14 @@ def main():
                     )
 
                     if dominance_msg:
-                        log.info("ALERT (dominance ratio):\n" + dominance_msg)
+                        log.info("ALERT (home dominance):\n" + dominance_msg)
                         scraper.send_telegram_message(
                             dominance_msg,
                             BOT_TOKEN,
                             CHAT_ID
                         )
                     else:
-                        log.info("No dominance-ratio signal found.")
+                        log.info("No home-dominance signal found.")
 
                 except Exception as match_err:
                     log.error(
@@ -1658,7 +1630,7 @@ def main():
             )
 
             send_job_status(
-                f"✅ Dominance-ratio alert FINISHED\n"
+                f"✅ Home-dominance alert FINISHED\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, analyzed "
                 f"{analyzed_count}/{len(batch_matches)} in this batch",
@@ -1668,11 +1640,11 @@ def main():
 
     except Exception as e:
 
-        log.error(f"Dominance-ratio alert job failed: {e}")
+        log.error(f"Home-dominance alert job failed: {e}")
         log.error(traceback.format_exc())
 
         send_job_status(
-            f"❌ Dominance-ratio alert FAILED\n"
+            f"❌ Home-dominance alert FAILED\n"
             f"Batch START={START} LIMIT={LIMIT}\n"
             f"Found {len(matches)} matches today, analyzed "
             f"{analyzed_count} before failing\n"
