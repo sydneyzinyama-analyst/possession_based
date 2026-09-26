@@ -451,19 +451,20 @@ class SixtyFiveScoresScraper:
             log.warning(f"Error closing session: {e}")
 
 
-# ---------------- ATTACK VS WEAK DEFENSE SIGNAL ENGINE ----------------
+# ---------------- WEAK AWAY TEAM SIGNAL ENGINE ----------------
 #
-# One-directional on purpose, same as the filter this replaces: only
-# the HOME side is ever checked as the strong attack, and only the
-# AWAY side is ever checked as the weak defense. The claim is
-# narrower than "better in every department" — it doesn't care whether
-# the home team is ahead on possession or corners, only two specific
-# things: does the home side have a genuinely potent attack in
-# absolute terms (not just "better than this opponent"), and does the
-# away side have a genuinely leaky defense in absolute terms. Both are
-# judged against fixed floors, not relative comparisons — a strong
-# attack is strong on its own merits, not just because the opponent
-# happens to be worse.
+# One-directional on purpose: this only ever backs the claim that the
+# AWAY side is weak — the home side is never checked as the weak one.
+# Two things have to both hold: the away side is projected to score
+# 1 goal at most against this specific home defense (not just "fewer
+# than the home side", an absolute ceiling), AND the home side
+# projects a real edge over the away side (so "unlikely to win" isn't
+# just a coin flip going the other way). "Projected" uses the same
+# blended for+against expected-goals estimate this script's earlier
+# signals have used — xG-based when both sides have full xG/xGA data,
+# a raw-goals fallback otherwise — since a team's likely output
+# against a SPECIFIC opponent depends on both that team's own attack
+# and the opponent's own defense, not either alone.
 #
 # NOTE ON CONFIDENCE: same disclaimer as every version of this file —
 # every threshold below is a heuristic cutoff, not a measured
@@ -471,33 +472,34 @@ class SixtyFiveScoresScraper:
 
 MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
 
-# "Strong attack" absolute floors (home side). Core, hard-required —
-# xG is deliberately left out of the hard gate (folded into the
-# corroboration score instead) so a minor-league match missing xG
-# data can still qualify on the raw counting stats.
-STRONG_ATTACK_MIN_GOALS = 1.8
-STRONG_ATTACK_MIN_SHOTS = 12.0
-STRONG_ATTACK_MIN_SOT = 4.5
+# The literal claim: away's projected output against this home side
+# has to sit at or below this — "unlikely to score more than 1".
+AWAY_WEAK_MAX_EXPECTED_GOALS = 1.1
 
-# "Weak defense" absolute floors (away side). Same reasoning — xGA
-# and big-chances-conceded are corroboration, not hard-required.
-WEAK_DEFENSE_MIN_CONCEDED = 1.5
-WEAK_DEFENSE_MIN_SHOTS_AGAINST = 12.0
+# Sanity check on top of the projection: away's own raw scoring
+# average (regardless of opponent) has to independently support being
+# a low-scoring side — a team that normally scores freely projecting
+# low against one tough defense is a different, weaker claim than a
+# team that barely scores at all.
+AWAY_WEAK_MAX_OWN_GOALS = 1.2
+
+# How much of a projected edge the home side needs over the away side
+# for "away unlikely to win" to mean something beyond a marginal call.
+HOME_EDGE_MIN_MARGIN = 0.3
 
 # Corroboration floors — used only in the scoring function below, not
 # the hard gate, so their absence doesn't disqualify a match.
-STRONG_ATTACK_MIN_XG = 1.5
-WEAK_DEFENSE_MIN_XGA = 1.3
-WEAK_DEFENSE_MIN_BIG_CHANCES_AGAINST = 1.5
-STRONG_ATTACK_MIN_BIG_CHANCES = 2.0
+AWAY_WEAK_MAX_XG = 1.0
+AWAY_WEAK_MAX_SHOTS = 10.0
+AWAY_WEAK_MAX_SOT = 4.0
+AWAY_WEAK_MIN_OWN_CONCEDED = 1.3
 
-# Corroboration bar on top of the hard gate (strong attack + weak
-# defense both cleared). Max achievable is 4.0 (1 home's xG backs up
-# the raw attacking numbers + 1 away's xGA backs up the raw leakiness
-# + 1 away concedes a healthy volume of big chances, not just more
-# shots + 1 home creates a healthy volume of big chances of its own);
-# set at half of that.
-ATTACK_VS_DEFENSE_SCORE_THRESHOLD = 2.0
+# Corroboration bar on top of the hard gate. Max achievable is 4.0 (1
+# away's own xG backs up the low-scoring profile + 1 away creates
+# little shot volume + 1 away creates little on target + 1 away's own
+# defense is leaky too, reinforcing "unlikely to win" beyond just not
+# scoring); set at half of that.
+AWAY_WEAK_SCORE_THRESHOLD = 2.0
 
 
 def _escape_markdown(text):
@@ -510,83 +512,70 @@ def _escape_markdown(text):
     return re.sub(r"([_*`\[])", r"\\\1", str(text))
 
 
-def _has_strong_attack(home):
+def _expected_goals(home, away):
     """
-    Hard gate: True only if the home side clears ALL of
-    STRONG_ATTACK_MIN_GOALS/SHOTS/SOT in absolute terms — a strong
-    attack is judged on its own merits, not relative to whichever
-    opponent it's facing. Fails closed on any missing input.
+    Blended for+against expected-goals estimate for both sides: xG-
+    based when both sides have full xG/xGA data, a raw-goals fallback
+    otherwise. Returns (expected_home_goals, expected_away_goals,
+    basis) — the one pair of numbers that already combines each
+    side's own attacking rate with the OTHER side's own defensive
+    leakiness, rather than reading either side's stats in isolation.
     """
-    g = home.get("avg_goals")
-    shots = home.get("avg_shots_for")
-    sot = home.get("avg_sot_for")
+    home_xg, away_xg = home.get("avg_xg"), away.get("avg_xg")
+    home_xga, away_xga = home.get("avg_xga"), away.get("avg_xga")
 
-    if g is None or shots is None or sot is None:
-        return False
+    if None not in (home_xg, away_xg, home_xga, away_xga):
+        expected_home = (home_xg + away_xga) / 2
+        expected_away = (away_xg + home_xga) / 2
+        basis = "xG-based"
+    else:
+        home_g, away_g = home.get("avg_goals", 0), away.get("avg_goals", 0)
+        home_gc, away_gc = home.get("avg_gc", 0), away.get("avg_gc", 0)
+        expected_home = (home_g + away_gc) / 2
+        expected_away = (away_g + home_gc) / 2
+        basis = "goals-based, no xG data"
 
-    return (
-        g >= STRONG_ATTACK_MIN_GOALS
-        and shots >= STRONG_ATTACK_MIN_SHOTS
-        and sot >= STRONG_ATTACK_MIN_SOT
-    )
+    return expected_home, expected_away, basis
 
 
-def _has_weak_defense(away):
+def _away_weak_score(away):
     """
-    Hard gate: True only if the away side clears BOTH
-    WEAK_DEFENSE_MIN_CONCEDED/SHOTS_AGAINST in absolute terms. Fails
-    closed on any missing input.
-    """
-    gc = away.get("avg_gc")
-    shots_against = away.get("avg_shots_against")
-
-    if gc is None or shots_against is None:
-        return False
-
-    return (
-        gc >= WEAK_DEFENSE_MIN_CONCEDED
-        and shots_against >= WEAK_DEFENSE_MIN_SHOTS_AGAINST
-    )
-
-
-def _attack_vs_defense_score(home, away):
-    """
-    Corroboration score on top of the two hard gates — every factor
-    here is an extra, independent reason the attack-vs-defense
-    mismatch is genuinely meaningful rather than just clearing the
-    bare-minimum raw counting stats. All lookups None-safe.
+    Corroboration score — every factor here is an extra, independent
+    reason the away side's low-scoring, unlikely-to-win profile is
+    genuinely real rather than a one-off projection against this one
+    matchup. All lookups None-safe.
     """
     score = 0.0
 
-    home_xg = home.get("avg_xg")
-    if home_xg is not None and home_xg >= STRONG_ATTACK_MIN_XG:
+    away_xg = away.get("avg_xg")
+    if away_xg is not None and away_xg <= AWAY_WEAK_MAX_XG:
         score += 1
 
-    away_xga = away.get("avg_xga")
-    if away_xga is not None and away_xga >= WEAK_DEFENSE_MIN_XGA:
+    away_shots = away.get("avg_shots_for")
+    if away_shots is not None and away_shots <= AWAY_WEAK_MAX_SHOTS:
         score += 1
 
-    away_bc_against = away.get("avg_big_chances_against")
-    if away_bc_against is not None and away_bc_against >= WEAK_DEFENSE_MIN_BIG_CHANCES_AGAINST:
+    away_sot = away.get("avg_sot_for")
+    if away_sot is not None and away_sot <= AWAY_WEAK_MAX_SOT:
         score += 1
 
-    home_bc_for = home.get("avg_big_chances_for")
-    if home_bc_for is not None and home_bc_for >= STRONG_ATTACK_MIN_BIG_CHANCES:
+    away_gc = away.get("avg_gc")
+    if away_gc is not None and away_gc >= AWAY_WEAK_MIN_OWN_CONCEDED:
         score += 1
 
     return score
 
 
-def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
+def evaluate_weak_away_signal(home, away, home_data, away_data, m_url):
     """
-    Returns a Telegram-ready message if the HOME side has a strong
-    attack in absolute terms (see _has_strong_attack) AND the AWAY
-    side has a weak defense in absolute terms (see _has_weak_defense),
-    and the pairing clears ATTACK_VS_DEFENSE_SCORE_THRESHOLD worth of
-    corroboration (see _attack_vs_defense_score) — or None otherwise.
-    One-directional by design: the away side is never checked as the
-    strong attack, and the home side is never checked as the weak
-    defense.
+    Returns a Telegram-ready message if the AWAY side projects at most
+    AWAY_WEAK_MAX_EXPECTED_GOALS against this home side (see
+    _expected_goals), away's own raw scoring average independently
+    supports that (AWAY_WEAK_MAX_OWN_GOALS), the home side projects a
+    real edge (HOME_EDGE_MIN_MARGIN), and the away side clears
+    AWAY_WEAK_SCORE_THRESHOLD worth of corroboration (see
+    _away_weak_score) — or None otherwise. One-directional by design:
+    the home side is never checked as the weak one.
     """
     home = _escape_markdown(home)
     away = _escape_markdown(away)
@@ -600,15 +589,21 @@ def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
     ):
         return None
 
-    if not _has_strong_attack(hs):
+    away_g = as_.get("avg_goals")
+    if away_g is None or away_g > AWAY_WEAK_MAX_OWN_GOALS:
         return None
 
-    if not _has_weak_defense(as_):
+    expected_home, expected_away, basis = _expected_goals(hs, as_)
+
+    if expected_away > AWAY_WEAK_MAX_EXPECTED_GOALS:
         return None
 
-    score = _attack_vs_defense_score(hs, as_)
+    if (expected_home - expected_away) < HOME_EDGE_MIN_MARGIN:
+        return None
 
-    if score < ATTACK_VS_DEFENSE_SCORE_THRESHOLD:
+    score = _away_weak_score(as_)
+
+    if score < AWAY_WEAK_SCORE_THRESHOLD:
         return None
 
     # -------------------------------------------------
@@ -617,28 +612,20 @@ def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
 
     risks = []
 
-    h_xg = hs.get("avg_xg")
-    h_g = hs.get("avg_goals", 0)
-    if h_xg is not None and h_g >= h_xg + 1.0:
+    away_xg = as_.get("avg_xg")
+    away_xgot = as_.get("avg_xgot_for")
+    if away_xgot is not None and away_xg is not None and away_xgot >= away_xg + 0.3:
         risks.append(
-            f"{home} has been scoring above its own underlying chance "
-            f"quality (goals {h_g} vs xG {h_xg}) — some regression "
-            f"toward the mean is possible"
+            f"{away} has been clinical when it does get a chance "
+            f"(xGOT {away_xgot} vs xG {away_xg}) — a low volume of "
+            f"shots doesn't rule out one going in"
         )
 
-    h_gc = hs.get("avg_gc")
-    if h_gc is not None and h_gc >= WEAK_DEFENSE_MIN_CONCEDED:
+    home_gc = hs.get("avg_gc")
+    if home_gc is not None and home_gc >= 1.0:
         risks.append(
-            f"{home}'s own defense is leaky too (GA {h_gc}/match) — "
-            f"this could turn into an open, end-to-end game rather "
-            f"than a one-sided one"
-        )
-
-    a_xg = as_.get("avg_xg")
-    if a_xg is not None and a_xg >= 1.0:
-        risks.append(
-            f"{away} still averages {a_xg} xG/match despite the leaky "
-            f"defense — capable of scoring too, not just conceding"
+            f"{home}'s own defense isn't airtight either (GA "
+            f"{home_gc}/match) — some room for {away} to nick a goal"
         )
 
     # -------------------------------------------------
@@ -649,23 +636,25 @@ def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
         return "N/A" if v is None else str(v)
 
     lines = [
-        f"⚔️ *{home} vs {away}*",
+        f"📉 *{home} vs {away}*",
         "",
-        f"🎯 *Prediction: {home}'s strong attack (home) to exploit "
-        f"{away}'s weak defense*",
-        f"Corroboration score {score:.1f} "
-        f"(bar: {ATTACK_VS_DEFENSE_SCORE_THRESHOLD:.1f})",
+        f"🎯 *Prediction: {away} (away) unlikely to win, and unlikely "
+        f"to score more than 1 goal*",
+        f"Projected {home} ~{expected_home:.2f} vs {away} "
+        f"~{expected_away:.2f} ({basis}) | corroboration score "
+        f"{score:.1f} (bar: {AWAY_WEAK_SCORE_THRESHOLD:.1f})",
         "",
         "📊 *Stats*",
-        f"{home} (attack)   G {fmt(hs.get('avg_goals'))} | "
+        f"{away} (away)   G {fmt(as_.get('avg_goals'))} | "
+        f"GA {fmt(as_.get('avg_gc'))} | "
+        f"xG {fmt(as_.get('avg_xg'))} | "
+        f"Shots {fmt(as_.get('avg_shots_for'))} | "
+        f"SoT {fmt(as_.get('avg_sot_for'))}",
+        f"{home} (home)   G {fmt(hs.get('avg_goals'))} | "
+        f"GA {fmt(hs.get('avg_gc'))} | "
         f"xG {fmt(hs.get('avg_xg'))} | "
         f"Shots {fmt(hs.get('avg_shots_for'))} | "
-        f"SoT {fmt(hs.get('avg_sot_for'))} | "
-        f"BigCh {fmt(hs.get('avg_big_chances_for'))}",
-        f"{away} (defense)   GA {fmt(as_.get('avg_gc'))} | "
-        f"xGA {fmt(as_.get('avg_xga'))} | "
-        f"Shots against {fmt(as_.get('avg_shots_against'))} | "
-        f"BigCh against {fmt(as_.get('avg_big_chances_against'))}",
+        f"SoT {fmt(hs.get('avg_sot_for'))}",
         "",
     ]
 
@@ -677,6 +666,7 @@ def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
     lines.append(f"🔗 {m_url}")
 
     return "\n".join(lines)
+
 
 
 # ---------------- ALERT SCRIPT ----------------
@@ -721,13 +711,13 @@ def main():
         return
 
     send_job_status(
-        f"🚀 Job STARTED (soccer attack-vs-weak-defense alert)\n"
+        f"🚀 Job STARTED (soccer weak-away-team alert)\n"
         f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
     )
 
-    log.info("Starting 365scores attack-vs-weak-defense alert script...")
+    log.info("Starting 365scores weak-away-team alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     scraper = None
@@ -758,7 +748,7 @@ def main():
             log.info("No matches in this batch.")
 
             send_job_status(
-                f"⚠️ Attack-vs-weak-defense alert FINISHED (No matches)\n"
+                f"⚠️ Weak-away-team alert FINISHED (No matches)\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, 0 fell in this "
                 f"batch's range",
@@ -825,7 +815,7 @@ def main():
 
                     analyzed_count += 1
 
-                    dominance_msg = evaluate_attack_vs_defense_signal(
+                    weak_away_msg = evaluate_weak_away_signal(
                         home,
                         away,
                         home_data,
@@ -833,15 +823,15 @@ def main():
                         m_url
                     )
 
-                    if dominance_msg:
-                        log.info("ALERT (attack vs weak defense):\n" + dominance_msg)
+                    if weak_away_msg:
+                        log.info("ALERT (weak away team):\n" + weak_away_msg)
                         scraper.send_telegram_message(
-                            dominance_msg,
+                            weak_away_msg,
                             BOT_TOKEN,
                             CHAT_ID
                         )
                     else:
-                        log.info("No attack-vs-weak-defense signal found.")
+                        log.info("No weak-away-team signal found.")
 
                 except Exception as match_err:
                     log.error(
@@ -856,7 +846,7 @@ def main():
             )
 
             send_job_status(
-                f"✅ Attack-vs-weak-defense alert FINISHED\n"
+                f"✅ Weak-away-team alert FINISHED\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, analyzed "
                 f"{analyzed_count}/{len(batch_matches)} in this batch",
@@ -866,11 +856,11 @@ def main():
 
     except Exception as e:
 
-        log.error(f"Attack-vs-weak-defense alert job failed: {e}")
+        log.error(f"Weak-away-team alert job failed: {e}")
         log.error(traceback.format_exc())
 
         send_job_status(
-            f"❌ Attack-vs-weak-defense alert FAILED\n"
+            f"❌ Weak-away-team alert FAILED\n"
             f"Batch START={START} LIMIT={LIMIT}\n"
             f"Found {len(matches)} matches today, analyzed "
             f"{analyzed_count} before failing\n"
