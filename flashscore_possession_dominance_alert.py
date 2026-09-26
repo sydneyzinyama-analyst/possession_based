@@ -451,51 +451,35 @@ class SixtyFiveScoresScraper:
             log.warning(f"Error closing session: {e}")
 
 
-# ---------------- UNDER 3.5 GOALS SIGNAL ENGINE ----------------
+# ---------------- HOME DOMINANCE RATIO SIGNAL ENGINE ----------------
 #
-# Match-level, not team-directional: this asks whether the MATCH as a
-# whole — combined home + away output — is projected low enough to
-# trust "under 3.5 total goals", not which side is stronger. Each
-# side's own projected output against this specific opponent uses the
-# same blended for+against expected-goals estimate this script's
-# earlier signals have used (xG-based when both sides have full
-# xG/xGA data, a raw-goals fallback otherwise); the two are summed
-# into one combined projection, which has to sit meaningfully below
-# 3.5 — not just "any number under 3.5" — before this is trusted,
-# since match-to-match variance means a projection of exactly 3.4 is
-# a coinflip on actually finishing under the line, not a safe call.
+# One-directional on purpose: this only ever backs the HOME side —
+# the away side is never checked as the dominant one. The claim is a
+# single plain ratio: the home side's projected scoring output has to
+# be at least DOMINANCE_RATIO times the away side's — "85% better".
+# "Projected" uses the same blended for+against expected-goals
+# estimate this script's earlier signals have used (xG-based when
+# both sides have full xG/xGA data, a raw-goals fallback otherwise),
+# since a team's likely output against a SPECIFIC opponent depends on
+# both that team's own attack and the opponent's own defense, not
+# either alone. A ratio (not a flat point gap) is what makes "85%
+# better" a meaningful, scale-independent claim: it reads the same
+# whether the matchup is high-scoring or low-scoring.
 #
 # NOTE ON CONFIDENCE: same disclaimer as every version of this file —
-# every threshold below is a heuristic cutoff, not a measured
+# this is a heuristic cutoff on a blended estimate, not a measured
 # probability.
 
 MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
 
-# The market line this signal is actually about.
-UNDER_GOALS_LINE = 3.5
+# The literal claim: home's projected output must be at least this
+# many times away's. 1.85 = "85% better".
+DOMINANCE_RATIO = 1.85
 
-# How far below UNDER_GOALS_LINE the combined projection needs to sit
-# before it's trusted — the buffer that turns "technically under" into
-# "comfortably under".
-MAX_EXPECTED_COMBINED_GOALS = 2.6
-
-# Sanity check on top of the projection: each side's own raw scoring
-# average (regardless of opponent) has to independently support being
-# a modest-scoring side — two prolific attacks projecting low against
-# each other's specific defense is a weaker claim than two sides that
-# are independently low-scoring in general.
-OWN_GOALS_SANITY_MAX = 1.6
-
-# Corroboration floors — used only in the scoring function below, not
-# the hard gate, so their absence doesn't disqualify a match.
-BOTH_DEFENSES_SOLID_MAX_CONCEDED = 1.2
-COMBINED_SHOTS_MODEST_MAX = 22.0
-COMBINED_BIG_CHANCES_MODEST_MAX = 2.5
-
-# Corroboration bar on top of the hard gate. Max achievable is 4.0 (1
-# home defense solid + 1 away defense solid + 1 combined shot volume
-# modest + 1 combined big chances modest); set at half of that.
-UNDER_GOALS_SCORE_THRESHOLD = 2.0
+# A ratio against a near-zero expected output is meaningless (could
+# read as "infinitely better" over noise) — the away side's expected
+# output has to clear this floor before the ratio is trusted at all.
+MIN_EXPECTED_AWAY_OUTPUT = 0.2
 
 
 def _escape_markdown(text):
@@ -534,47 +518,14 @@ def _expected_goals(home, away):
     return expected_home, expected_away, basis
 
 
-def _under_goals_score(home, away):
+def evaluate_home_dominance_ratio_signal(home, away, home_data, away_data, m_url):
     """
-    Corroboration score — every factor here is an extra, independent
-    reason the low combined projection is genuinely a low-scoring
-    match, not just an artifact of this one blended projection. All
-    lookups None-safe.
-    """
-    score = 0.0
-
-    home_gc = home.get("avg_gc")
-    if home_gc is not None and home_gc <= BOTH_DEFENSES_SOLID_MAX_CONCEDED:
-        score += 1
-
-    away_gc = away.get("avg_gc")
-    if away_gc is not None and away_gc <= BOTH_DEFENSES_SOLID_MAX_CONCEDED:
-        score += 1
-
-    home_shots = home.get("avg_shots_for")
-    away_shots = away.get("avg_shots_for")
-    if home_shots is not None and away_shots is not None:
-        if (home_shots + away_shots) <= COMBINED_SHOTS_MODEST_MAX:
-            score += 1
-
-    home_bc = home.get("avg_big_chances_for")
-    away_bc = away.get("avg_big_chances_for")
-    if home_bc is not None and away_bc is not None:
-        if (home_bc + away_bc) <= COMBINED_BIG_CHANCES_MODEST_MAX:
-            score += 1
-
-    return score
-
-
-def evaluate_under_goals_signal(home, away, home_data, away_data, m_url):
-    """
-    Returns a Telegram-ready message if the match's combined projected
-    output (see _expected_goals) sits at or below
-    MAX_EXPECTED_COMBINED_GOALS, each side's own raw scoring average
-    independently supports that (OWN_GOALS_SANITY_MAX), and the match
-    clears UNDER_GOALS_SCORE_THRESHOLD worth of corroboration (see
-    _under_goals_score) — or None otherwise. Match-level, not
-    directional — neither side is singled out as "the weak one".
+    Returns a Telegram-ready message if the HOME side's projected
+    scoring output (see _expected_goals) is at least DOMINANCE_RATIO
+    times the away side's, with the away side's own expected output
+    clearing MIN_EXPECTED_AWAY_OUTPUT first (see that constant's
+    comment) — or None otherwise. One-directional by design: the away
+    side is never checked as the dominant one.
     """
     home = _escape_markdown(home)
     away = _escape_markdown(away)
@@ -588,23 +539,15 @@ def evaluate_under_goals_signal(home, away, home_data, away_data, m_url):
     ):
         return None
 
-    home_g = hs.get("avg_goals")
-    away_g = as_.get("avg_goals")
-    if home_g is None or away_g is None:
-        return None
-    if home_g > OWN_GOALS_SANITY_MAX or away_g > OWN_GOALS_SANITY_MAX:
-        return None
-
     expected_home, expected_away, basis = _expected_goals(hs, as_)
-    expected_combined = expected_home + expected_away
 
-    if expected_combined > MAX_EXPECTED_COMBINED_GOALS:
+    if expected_away < MIN_EXPECTED_AWAY_OUTPUT:
         return None
 
-    score = _under_goals_score(hs, as_)
-
-    if score < UNDER_GOALS_SCORE_THRESHOLD:
+    if expected_home < DOMINANCE_RATIO * expected_away:
         return None
+
+    pct_better = (expected_home / expected_away - 1) * 100
 
     # -------------------------------------------------
     # RISK FACTORS (shown, don't block the prediction)
@@ -612,34 +555,22 @@ def evaluate_under_goals_signal(home, away, home_data, away_data, m_url):
 
     risks = []
 
-    home_xgot = hs.get("avg_xgot_for")
-    home_xg = hs.get("avg_xg")
-    if home_xgot is not None and home_xg is not None and home_xgot >= home_xg + 0.3:
+    h_xg = hs.get("avg_xg")
+    h_g = hs.get("avg_goals", 0)
+    if h_xg is not None and h_g >= h_xg + 1.0:
         risks.append(
-            f"{home} has been clinical when it does get a chance "
-            f"(xGOT {home_xgot} vs xG {home_xg}) — capable of making a "
-            f"low volume of shots count"
+            f"{home} has been scoring above its own underlying chance "
+            f"quality (goals {h_g} vs xG {h_xg}) — some regression "
+            f"toward the mean is possible"
         )
 
-    away_xgot = as_.get("avg_xgot_for")
-    away_xg = as_.get("avg_xg")
-    if away_xgot is not None and away_xg is not None and away_xgot >= away_xg + 0.3:
+    a_xg = as_.get("avg_xg")
+    if a_xg is not None and a_xg >= 1.0:
         risks.append(
-            f"{away} has been clinical when it does get a chance "
-            f"(xGOT {away_xgot} vs xG {away_xg}) — capable of making a "
-            f"low volume of shots count"
+            f"{away} still averages {a_xg} xG/match despite projecting "
+            f"well behind here — capable of making the few chances "
+            f"they get count"
         )
-
-    home_corners = hs.get("avg_corners_for")
-    away_corners = as_.get("avg_corners_for")
-    if home_corners is not None and away_corners is not None:
-        combined_corners = home_corners + away_corners
-        if combined_corners >= 11.0:
-            risks.append(
-                f"Combined corners are fairly high ({combined_corners:.1f}) "
-                f"— set-piece goal risk isn't fully captured by the "
-                f"open-play projection above"
-            )
 
     # -------------------------------------------------
     # MESSAGE
@@ -649,27 +580,29 @@ def evaluate_under_goals_signal(home, away, home_data, away_data, m_url):
         return "N/A" if v is None else str(v)
 
     lines = [
-        f"🔒 *{home} vs {away}*",
+        f"📈 *{home} vs {away}*",
         "",
-        f"🎯 *Prediction: Under {UNDER_GOALS_LINE} total goals*",
-        f"Projected combined ~{expected_combined:.2f} "
-        f"({home} ~{expected_home:.2f} + {away} ~{expected_away:.2f}, "
-        f"{basis}) | corroboration score {score:.1f} "
-        f"(bar: {UNDER_GOALS_SCORE_THRESHOLD:.1f})",
+        f"🎯 *Prediction: {home} (home) projects at least "
+        f"{(DOMINANCE_RATIO - 1) * 100:.0f}% stronger than {away} "
+        f"right now*",
+        f"Expected output {home} ~{expected_home:.2f} vs {away} "
+        f"~{expected_away:.2f} ({basis}) — {pct_better:.0f}% higher",
         "",
-        "📊 *Stats*",
-        f"{home}   G {fmt(hs.get('avg_goals'))} | "
+        "📊 *Stats (for reference)*",
+        f"{home} (home)   G {fmt(hs.get('avg_goals'))} | "
         f"GA {fmt(hs.get('avg_gc'))} | "
         f"xG {fmt(hs.get('avg_xg'))} | "
         f"xGA {fmt(hs.get('avg_xga'))} | "
         f"Shots {fmt(hs.get('avg_shots_for'))} | "
-        f"BigCh {fmt(hs.get('avg_big_chances_for'))}",
-        f"{away}   G {fmt(as_.get('avg_goals'))} | "
+        f"SoT {fmt(hs.get('avg_sot_for'))} | "
+        f"Poss {fmt(hs.get('avg_possession'))}%",
+        f"{away} (away)   G {fmt(as_.get('avg_goals'))} | "
         f"GA {fmt(as_.get('avg_gc'))} | "
         f"xG {fmt(as_.get('avg_xg'))} | "
         f"xGA {fmt(as_.get('avg_xga'))} | "
         f"Shots {fmt(as_.get('avg_shots_for'))} | "
-        f"BigCh {fmt(as_.get('avg_big_chances_for'))}",
+        f"SoT {fmt(as_.get('avg_sot_for'))} | "
+        f"Poss {fmt(as_.get('avg_possession'))}%",
         "",
     ]
 
@@ -725,13 +658,13 @@ def main():
         return
 
     send_job_status(
-        f"🚀 Job STARTED (soccer under-3.5-goals alert)\n"
+        f"🚀 Job STARTED (soccer home-dominance-ratio alert)\n"
         f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
     )
 
-    log.info("Starting 365scores under-3.5-goals alert script...")
+    log.info("Starting 365scores home-dominance-ratio alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     scraper = None
@@ -762,7 +695,7 @@ def main():
             log.info("No matches in this batch.")
 
             send_job_status(
-                f"⚠️ Under-3.5-goals alert FINISHED (No matches)\n"
+                f"⚠️ Home-dominance-ratio alert FINISHED (No matches)\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, 0 fell in this "
                 f"batch's range",
@@ -829,7 +762,7 @@ def main():
 
                     analyzed_count += 1
 
-                    under_goals_msg = evaluate_under_goals_signal(
+                    dominance_msg = evaluate_home_dominance_ratio_signal(
                         home,
                         away,
                         home_data,
@@ -837,15 +770,15 @@ def main():
                         m_url
                     )
 
-                    if under_goals_msg:
-                        log.info("ALERT (under 3.5 goals):\n" + under_goals_msg)
+                    if dominance_msg:
+                        log.info("ALERT (home dominance ratio):\n" + dominance_msg)
                         scraper.send_telegram_message(
-                            under_goals_msg,
+                            dominance_msg,
                             BOT_TOKEN,
                             CHAT_ID
                         )
                     else:
-                        log.info("No under-3.5-goals signal found.")
+                        log.info("No home-dominance-ratio signal found.")
 
                 except Exception as match_err:
                     log.error(
@@ -860,7 +793,7 @@ def main():
             )
 
             send_job_status(
-                f"✅ Under-3.5-goals alert FINISHED\n"
+                f"✅ Home-dominance-ratio alert FINISHED\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, analyzed "
                 f"{analyzed_count}/{len(batch_matches)} in this batch",
@@ -870,11 +803,11 @@ def main():
 
     except Exception as e:
 
-        log.error(f"Under-3.5-goals alert job failed: {e}")
+        log.error(f"Home-dominance-ratio alert job failed: {e}")
         log.error(traceback.format_exc())
 
         send_job_status(
-            f"❌ Under-3.5-goals alert FAILED\n"
+            f"❌ Home-dominance-ratio alert FAILED\n"
             f"Batch START={START} LIMIT={LIMIT}\n"
             f"Found {len(matches)} matches today, analyzed "
             f"{analyzed_count} before failing\n"
