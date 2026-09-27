@@ -494,108 +494,102 @@ def _expected_goals(home, away):
     return expected_home, expected_away, basis
 
 
-# ---------------- STRONG ATTACK VS WEAK DEFENSE SIGNAL ENGINE ----------------
+# ---------------- HOME POSSESSION DOMINANCE SIGNAL ENGINE ----------------
 #
-# Team-directional: checked both ways round (home attack vs away
-# defense, then away attack vs home defense), so a match can fire for
-# either side, both, or neither. Same "absolute gates, no
-# corroboration score" shape as earlier filters in this file: the
-# attacking side's own record has to show a genuinely strong attack,
-# the defending side's own record has to show a genuinely leaky
-# defense, and the blended projection for the attacking side (see
-# _expected_goals) has to back the claim up on its own terms.
+# Home-team only. Claim: the home side will have the ball and control
+# the game. Same "absolute gates, no corroboration score" shape as
+# earlier filters in this file: the home side's own record has to
+# show it habitually dominates the ball, the away side's own record
+# has to show it habitually cedes it, those have to hold match after
+# match (not one freak 80% game dragging the average up), and the
+# blended projection has to clear the line on its own terms.
 #
-# Goals-based gates are always required. xG / shots-on-target gates
-# only apply when that data exists for the team — lower leagues often
-# have no xG, and a missing number shouldn't block an otherwise clear
-# mismatch (the message shows N/A so it's visible).
+# Possession data is required — unlike xG there is no sensible
+# fallback for it, so a team with no possession numbers never fires.
 #
 # NOTE ON CONFIDENCE: same disclaimer as every version of this file —
 # every threshold below is a heuristic cutoff, not a measured
 # probability.
 
-ATTACK_TEAM_GOALS_LINE = 1.5
+# Home side's own average possession.
+HOME_MIN_AVG_POSSESSION = 58.0
+# Away side's own average possession.
+AWAY_MAX_AVG_POSSESSION = 48.0
 
-# Strong attack — attacking side's own "for" numbers.
-STRONG_ATTACK_MIN_GOALS = 1.8
-STRONG_ATTACK_MIN_XG = 1.6
-STRONG_ATTACK_MIN_SOT = 5.0
+# Consistency: in at least this many of the sampled matches, the home
+# side had >= HOME_DOMINANT_MATCH_POSSESSION and the away side had
+# <= AWAY_CEDING_MATCH_POSSESSION.
+HOME_DOMINANT_MATCH_POSSESSION = 55.0
+AWAY_CEDING_MATCH_POSSESSION = 50.0
+MIN_CONSISTENT_MATCHES = 4
 
-# Weak defense — defending side's own "against" numbers.
-WEAK_DEFENSE_MIN_CONCEDED = 1.6
-WEAK_DEFENSE_MIN_XGA = 1.5
-WEAK_DEFENSE_MIN_SOT_AGAINST = 5.0
-
-# Blended projection for the attacking side must clear this.
-ATTACK_MIN_EXPECTED_GOALS = 1.8
+# Blended projection (home avg + 100 - away avg) / 2 must clear this.
+MIN_PROJECTED_HOME_POSSESSION = 58.0
 
 
-def _check_attack_vs_defense(att, dfn):
+def _team_possession_by_match(team_data):
     """
-    Returns True if every strong-attack / weak-defense gate passes,
-    None otherwise. `att` / `dfn` are the stats dicts of the
-    attacking and defending side respectively.
+    The team's own possession figure in each sampled match that has
+    one, in match order.
     """
-    att_g = att.get("avg_goals")
-    dfn_gc = dfn.get("avg_gc")
-    if att_g is None or dfn_gc is None:
-        return None
-
-    if att_g < STRONG_ATTACK_MIN_GOALS:
-        return None
-    if dfn_gc < WEAK_DEFENSE_MIN_CONCEDED:
-        return None
-
-    att_xg = att.get("avg_xg")
-    if att_xg is not None and att_xg < STRONG_ATTACK_MIN_XG:
-        return None
-
-    att_sot = att.get("avg_sot_for")
-    if att_sot is not None and att_sot < STRONG_ATTACK_MIN_SOT:
-        return None
-
-    dfn_xga = dfn.get("avg_xga")
-    if dfn_xga is not None and dfn_xga < WEAK_DEFENSE_MIN_XGA:
-        return None
-
-    dfn_sot_against = dfn.get("avg_sot_against")
-    if dfn_sot_against is not None and dfn_sot_against < WEAK_DEFENSE_MIN_SOT_AGAINST:
-        return None
-
-    return True
+    team_id = team_data["team_id"]
+    values = []
+    for r in team_data["results"]:
+        if r.get("home_id") == team_id:
+            v = r.get("home_possession")
+        elif r.get("away_id") == team_id:
+            v = r.get("away_possession")
+        else:
+            continue
+        if v is not None:
+            values.append(v)
+    return values
 
 
-def evaluate_attack_vs_defense_signal(
-    att_name, dfn_name, att_data, dfn_data, att_is_home, m_url
-):
+def evaluate_home_possession_signal(home, away, home_data, away_data, m_url):
     """
-    Returns a Telegram-ready message if the attacking side's own record
-    shows a strong attack (STRONG_ATTACK_*), the defending side's own
-    record shows a weak defense (WEAK_DEFENSE_*), AND the attacking
-    side's blended projection (see _expected_goals) clears
-    ATTACK_MIN_EXPECTED_GOALS — or None otherwise.
+    Returns a Telegram-ready message if the home side habitually
+    dominates the ball (HOME_MIN_AVG_POSSESSION, consistent across
+    MIN_CONSISTENT_MATCHES), the away side habitually cedes it
+    (AWAY_MAX_AVG_POSSESSION, same consistency check), AND the blended
+    projection clears MIN_PROJECTED_HOME_POSSESSION — or None
+    otherwise.
     """
-    att_esc = _escape_markdown(att_name)
-    dfn_esc = _escape_markdown(dfn_name)
+    home = _escape_markdown(home)
+    away = _escape_markdown(away)
 
-    ats = att_data["stats"]
-    dfs = dfn_data["stats"]
+    hs = home_data["stats"]
+    as_ = away_data["stats"]
 
     if (
-        ats.get("matches", 0) < MIN_SAMPLE_MATCHES
-        or dfs.get("matches", 0) < MIN_SAMPLE_MATCHES
+        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
+        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
     ):
         return None
 
-    if not _check_attack_vs_defense(ats, dfs):
+    home_poss = hs.get("avg_possession")
+    away_poss = as_.get("avg_possession")
+    if home_poss is None or away_poss is None:
         return None
 
-    if att_is_home:
-        expected_att, expected_dfn, basis = _expected_goals(ats, dfs)
-    else:
-        expected_dfn, expected_att, basis = _expected_goals(dfs, ats)
+    if home_poss < HOME_MIN_AVG_POSSESSION:
+        return None
+    if away_poss > AWAY_MAX_AVG_POSSESSION:
+        return None
 
-    if expected_att < ATTACK_MIN_EXPECTED_GOALS:
+    home_series = _team_possession_by_match(home_data)
+    away_series = _team_possession_by_match(away_data)
+
+    home_dominant = sum(1 for v in home_series if v >= HOME_DOMINANT_MATCH_POSSESSION)
+    away_ceding = sum(1 for v in away_series if v <= AWAY_CEDING_MATCH_POSSESSION)
+
+    if home_dominant < MIN_CONSISTENT_MATCHES:
+        return None
+    if away_ceding < MIN_CONSISTENT_MATCHES:
+        return None
+
+    projected = (home_poss + (100 - away_poss)) / 2
+    if projected < MIN_PROJECTED_HOME_POSSESSION:
         return None
 
     # -------------------------------------------------
@@ -604,39 +598,30 @@ def evaluate_attack_vs_defense_signal(
 
     risks = []
 
-    att_g = ats.get("avg_goals")
-    att_xg = ats.get("avg_xg")
-    if att_xg is not None and att_g >= att_xg + 0.5:
+    home_shots = hs.get("avg_shots_for")
+    home_bc = hs.get("avg_big_chances_for")
+    if (home_shots is not None and home_shots < 11) or (
+        home_bc is not None and home_bc < 1.5
+    ):
         risks.append(
-            f"{att_esc} has been over-performing its chances (goals "
-            f"{att_g} vs xG {att_xg}) — finishing may cool off"
+            f"{home}'s possession has been fairly sterile (shots "
+            f"{home_shots if home_shots is not None else 'N/A'}, big "
+            f"chances {home_bc if home_bc is not None else 'N/A'}) — "
+            f"control doesn't guarantee chances"
         )
 
-    dfn_gc = dfs.get("avg_gc")
-    dfn_xga = dfs.get("avg_xga")
-    if dfn_xga is not None and dfn_gc >= dfn_xga + 0.5:
+    away_g = as_.get("avg_goals")
+    if away_g is not None and away_g >= 1.3:
         risks.append(
-            f"{dfn_esc} has conceded more than the chances allowed "
-            f"(GA {dfn_gc} vs xGA {dfn_xga}) — defense may be better "
-            f"than the goals suggest"
+            f"{away} scores well without the ball ({away_g} per game "
+            f"on {away_poss}% possession) — dangerous on the counter"
         )
 
-    att_bc = ats.get("avg_big_chances_for")
-    if att_bc is not None and att_bc < 1.5:
+    if home_series and max(home_series) - min(home_series) >= 20:
         risks.append(
-            f"{att_esc} creates few big chances ({att_bc} per game) — "
-            f"output leans on lower-quality shots"
+            f"{home}'s possession swings a lot match to match "
+            f"({min(home_series):.0f}%–{max(home_series):.0f}%)"
         )
-
-    dfn_g = dfs.get("avg_goals")
-    if dfn_g is not None and dfn_g >= 1.5:
-        risks.append(
-            f"{dfn_esc} scores freely itself ({dfn_g} per game) — could "
-            f"turn into an open game rather than one-way traffic"
-        )
-
-    if att_xg is None or dfn_xga is None:
-        risks.append("xG data missing for one side — goals-only check")
 
     # -------------------------------------------------
     # MESSAGE
@@ -645,29 +630,36 @@ def evaluate_attack_vs_defense_signal(
     def fmt(v):
         return "N/A" if v is None else str(v)
 
-    venue = "home" if att_is_home else "away"
+    def series(vals):
+        return " / ".join(f"{v:.0f}" for v in vals) or "N/A"
 
     lines = [
-        f"⚔️ *{att_esc} ({venue}) attack vs {dfn_esc} defense*",
+        f"🎮 *{home} vs {away}*",
         "",
-        f"🎯 *Prediction: {att_esc} Over {ATTACK_TEAM_GOALS_LINE} team goals*",
-        f"Projected {att_esc} ~{expected_att:.2f} vs "
-        f"{dfn_esc} ~{expected_dfn:.2f} ({basis})",
+        f"🎯 *Prediction: {home} (home) dominates possession*",
+        f"Projected {home} ~{projected:.0f}% of the ball",
         "",
-        f"💥 *{att_esc} attack*",
-        f"G {fmt(ats.get('avg_goals'))} | "
-        f"xG {fmt(ats.get('avg_xg'))} | "
-        f"Shots {fmt(ats.get('avg_shots_for'))} | "
-        f"SoT {fmt(ats.get('avg_sot_for'))} | "
-        f"BigCh {fmt(ats.get('avg_big_chances_for'))} | "
-        f"Poss {fmt(ats.get('avg_possession'))}",
+        "📊 *Possession*",
+        f"{home}   avg {fmt(home_poss)}% | "
+        f"{home_dominant}/{len(home_series)} games ≥ "
+        f"{HOME_DOMINANT_MATCH_POSSESSION:.0f}%",
+        f"   last games: {series(home_series)}",
+        f"{away}   avg {fmt(away_poss)}% | "
+        f"{away_ceding}/{len(away_series)} games ≤ "
+        f"{AWAY_CEDING_MATCH_POSSESSION:.0f}%",
+        f"   last games: {series(away_series)}",
         "",
-        f"🧱 *{dfn_esc} defense*",
-        f"GA {fmt(dfs.get('avg_gc'))} | "
-        f"xGA {fmt(dfs.get('avg_xga'))} | "
-        f"Shots vs {fmt(dfs.get('avg_shots_against'))} | "
-        f"SoT vs {fmt(dfs.get('avg_sot_against'))} | "
-        f"BigCh vs {fmt(dfs.get('avg_big_chances_against'))}",
+        "📈 *Stats*",
+        f"{home}   G {fmt(hs.get('avg_goals'))} | "
+        f"GA {fmt(hs.get('avg_gc'))} | "
+        f"xG {fmt(hs.get('avg_xg'))} | "
+        f"Shots {fmt(hs.get('avg_shots_for'))} | "
+        f"Corners {fmt(hs.get('avg_corners_for'))}",
+        f"{away}   G {fmt(as_.get('avg_goals'))} | "
+        f"GA {fmt(as_.get('avg_gc'))} | "
+        f"xG {fmt(as_.get('avg_xg'))} | "
+        f"Shots {fmt(as_.get('avg_shots_for'))} | "
+        f"Corners {fmt(as_.get('avg_corners_for'))}",
         "",
     ]
 
@@ -723,13 +715,13 @@ def main():
         return
 
     send_job_status(
-        f"🚀 Job STARTED (soccer strong-attack-vs-weak-defense alert)\n"
+        f"🚀 Job STARTED (soccer home-possession-dominance alert)\n"
         f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
     )
 
-    log.info("Starting 365scores strong-attack-vs-weak-defense alert script...")
+    log.info("Starting 365scores home-possession-dominance alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     scraper = None
@@ -760,7 +752,7 @@ def main():
             log.info("No matches in this batch.")
 
             send_job_status(
-                f"⚠️ Strong-attack-vs-weak-defense alert FINISHED (No matches)\n"
+                f"⚠️ Home-possession-dominance alert FINISHED (No matches)\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, 0 fell in this "
                 f"batch's range",
@@ -827,30 +819,16 @@ def main():
 
                     analyzed_count += 1
 
-                    home_attack_msg = evaluate_attack_vs_defense_signal(
+                    home_poss_msg = evaluate_home_possession_signal(
                         home,
                         away,
                         home_data,
                         away_data,
-                        True,
                         m_url
                     )
 
-                    away_attack_msg = evaluate_attack_vs_defense_signal(
-                        away,
-                        home,
-                        away_data,
-                        home_data,
-                        False,
-                        m_url
-                    )
-
-                    # Checked both directions — a match can fire for
-                    # either side, both, or neither; each is sent as
-                    # its own alert.
                     fired_signals = [
-                        (f"{home} attack vs {away} defense", home_attack_msg),
-                        (f"{away} attack vs {home} defense", away_attack_msg),
+                        ("home possession dominance", home_poss_msg),
                     ]
 
                     any_fired = False
@@ -881,7 +859,7 @@ def main():
             )
 
             send_job_status(
-                f"✅ Strong-attack-vs-weak-defense alert FINISHED\n"
+                f"✅ Home-possession-dominance alert FINISHED\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, analyzed "
                 f"{analyzed_count}/{len(batch_matches)} in this batch",
@@ -891,11 +869,11 @@ def main():
 
     except Exception as e:
 
-        log.error(f"Strong-attack-vs-weak-defense alert job failed: {e}")
+        log.error(f"Home-possession-dominance alert job failed: {e}")
         log.error(traceback.format_exc())
 
         send_job_status(
-            f"❌ Strong-attack-vs-weak-defense alert FAILED\n"
+            f"❌ Home-possession-dominance alert FAILED\n"
             f"Batch START={START} LIMIT={LIMIT}\n"
             f"Found {len(matches)} matches today, analyzed "
             f"{analyzed_count} before failing\n"
