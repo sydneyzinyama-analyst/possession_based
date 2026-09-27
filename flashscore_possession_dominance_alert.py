@@ -635,6 +635,147 @@ def evaluate_strict_under_goals_signal(home, away, home_data, away_data, m_url):
     return "\n".join(lines)
 
 
+# ---------------- STRICT OVER 1.5 GOALS SIGNAL ENGINE ----------------
+#
+# A second, independent signal alongside the strict under-3.5 one
+# above — added, not a replacement. Match-level, not team-directional.
+# The mirror-image claim: this time the combined projected output has
+# to sit comfortably ABOVE 1.5, not below it — going UNDER would be
+# the shock. Same "absolute gates, no corroboration score" shape:
+# both teams' own raw scoring records independently show at least
+# some attacking life (guards against a genuine 0-0/1-0 risk that a
+# single blended number could paper over), their combined raw scoring
+# history backs up the claim on its own terms, and the combined
+# projected output clears 1.5 by a real margin, not a thin one.
+#
+# NOTE ON CONFIDENCE: same disclaimer as every version of this file —
+# every threshold below is a heuristic cutoff, not a measured
+# probability.
+
+STRICT_OVER_GOALS_LINE = 1.5
+
+# Hard gates — ALL must hold, no partial credit, no scoring layer.
+STRICT_MIN_EXPECTED_COMBINED_GOALS = 2.3
+STRICT_OVER_OWN_GOALS_MIN = 0.6
+STRICT_OVER_COMBINED_OWN_GOALS_MIN = 1.8
+
+
+def evaluate_strict_over_goals_signal(home, away, home_data, away_data, m_url):
+    """
+    Returns a Telegram-ready message if BOTH sides' own raw scoring
+    averages independently show at least some attacking life
+    (STRICT_OVER_OWN_GOALS_MIN each), their combined raw scoring
+    record clears STRICT_OVER_COMBINED_OWN_GOALS_MIN on its own terms,
+    AND the combined projected output (see _expected_goals) clears
+    STRICT_MIN_EXPECTED_COMBINED_GOALS — or None otherwise. Match-
+    level, not directional — neither side is singled out. No
+    corroboration score — these absolute gates are the whole check.
+    """
+    home = _escape_markdown(home)
+    away = _escape_markdown(away)
+
+    hs = home_data["stats"]
+    as_ = away_data["stats"]
+
+    if (
+        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
+        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
+    ):
+        return None
+
+    home_g, away_g = hs.get("avg_goals"), as_.get("avg_goals")
+
+    if home_g is None or away_g is None:
+        return None
+
+    if home_g < STRICT_OVER_OWN_GOALS_MIN or away_g < STRICT_OVER_OWN_GOALS_MIN:
+        return None
+
+    if (home_g + away_g) < STRICT_OVER_COMBINED_OWN_GOALS_MIN:
+        return None
+
+    expected_home, expected_away, basis = _expected_goals(hs, as_)
+    expected_combined = expected_home + expected_away
+
+    if expected_combined < STRICT_MIN_EXPECTED_COMBINED_GOALS:
+        return None
+
+    # -------------------------------------------------
+    # RISK FACTORS (shown, don't block the prediction)
+    # -------------------------------------------------
+
+    risks = []
+
+    home_xg = hs.get("avg_xg")
+    if home_xg is not None and home_g <= home_xg - 0.3:
+        risks.append(
+            f"{home} has been wasteful in front of goal (goals "
+            f"{home_g} vs xG {home_xg}) — actual output has lagged "
+            f"its own chance quality"
+        )
+
+    away_xg = as_.get("avg_xg")
+    if away_xg is not None and away_g <= away_xg - 0.3:
+        risks.append(
+            f"{away} has been wasteful in front of goal (goals "
+            f"{away_g} vs xG {away_xg}) — actual output has lagged "
+            f"its own chance quality"
+        )
+
+    home_gc = hs.get("avg_gc")
+    away_gc = as_.get("avg_gc")
+    if home_gc is not None and away_gc is not None:
+        if (home_gc + away_gc) <= 1.4:
+            risks.append(
+                f"Both defenses have been tight generally (combined GA "
+                f"{home_gc + away_gc:.1f}) — a rare low-scoring day is "
+                f"possible despite the projection above"
+            )
+
+    # -------------------------------------------------
+    # MESSAGE
+    # -------------------------------------------------
+
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
+    lines = [
+        f"📈📈 *{home} vs {away}*",
+        "",
+        f"🎯 *Prediction: Over {STRICT_OVER_GOALS_LINE} total goals* "
+        f"— going UNDER would be a shock",
+        f"Projected combined ~{expected_combined:.2f} "
+        f"({home} ~{expected_home:.2f} + {away} ~{expected_away:.2f}, "
+        f"{basis})",
+        "",
+        "📊 *Stats*",
+        f"{home}   G {fmt(hs.get('avg_goals'))} | "
+        f"GA {fmt(hs.get('avg_gc'))} | "
+        f"xG {fmt(hs.get('avg_xg'))} | "
+        f"xGA {fmt(hs.get('avg_xga'))} | "
+        f"Shots {fmt(hs.get('avg_shots_for'))} | "
+        f"SoT {fmt(hs.get('avg_sot_for'))} | "
+        f"BigCh {fmt(hs.get('avg_big_chances_for'))}",
+        f"{away}   G {fmt(as_.get('avg_goals'))} | "
+        f"GA {fmt(as_.get('avg_gc'))} | "
+        f"xG {fmt(as_.get('avg_xg'))} | "
+        f"xGA {fmt(as_.get('avg_xga'))} | "
+        f"Shots {fmt(as_.get('avg_shots_for'))} | "
+        f"SoT {fmt(as_.get('avg_sot_for'))} | "
+        f"BigCh {fmt(as_.get('avg_big_chances_for'))}",
+        "",
+    ]
+
+    if risks:
+        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
+        lines.extend(f"• {r}" for r in risks)
+        lines.append("")
+
+    lines.append(f"🔗 {m_url}")
+
+    return "\n".join(lines)
+
+
 # ---------------- ALERT SCRIPT ----------------
 
 def main():
@@ -677,7 +818,7 @@ def main():
         return
 
     send_job_status(
-        f"🚀 Job STARTED (soccer strict under-3.5-goals alert)\n"
+        f"🚀 Job STARTED (soccer strict under-3.5-goals + strict over-1.5-goals alert)\n"
         f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
@@ -789,15 +930,35 @@ def main():
                         m_url
                     )
 
-                    if strict_under_msg:
-                        log.info("ALERT (strict under 3.5 goals):\n" + strict_under_msg)
-                        scraper.send_telegram_message(
-                            strict_under_msg,
-                            BOT_TOKEN,
-                            CHAT_ID
-                        )
-                    else:
-                        log.info("No strict-under-3.5-goals signal found.")
+                    strict_over_msg = evaluate_strict_over_goals_signal(
+                        home,
+                        away,
+                        home_data,
+                        away_data,
+                        m_url
+                    )
+
+                    # Independent signals — a match can fire either,
+                    # both, or neither; each is sent as its own alert.
+                    fired_signals = [
+                        ("strict under 3.5 goals", strict_under_msg),
+                        ("strict over 1.5 goals", strict_over_msg),
+                    ]
+
+                    any_fired = False
+
+                    for label, sig_msg in fired_signals:
+                        if sig_msg:
+                            any_fired = True
+                            log.info(f"ALERT ({label}):\n" + sig_msg)
+                            scraper.send_telegram_message(
+                                sig_msg,
+                                BOT_TOKEN,
+                                CHAT_ID
+                            )
+
+                    if not any_fired:
+                        log.info("No signals found.")
 
                 except Exception as match_err:
                     log.error(
