@@ -494,66 +494,108 @@ def _expected_goals(home, away):
     return expected_home, expected_away, basis
 
 
-# ---------------- STRICT UNDER 3.5 GOALS SIGNAL ENGINE ----------------
+# ---------------- STRONG ATTACK VS WEAK DEFENSE SIGNAL ENGINE ----------------
 #
-# Match-level, not team-directional. No corroboration score here —
-# just the absolute numbers checked directly against the line: both
-# sides' raw scoring AND raw conceding records independently support
-# being a low-scoring, tight matchup (not just one or the other), and
-# the combined projected output sits far below 3.5 (a 1.5-goal
-# buffer, not a thin one).
+# Team-directional: checked both ways round (home attack vs away
+# defense, then away attack vs home defense), so a match can fire for
+# either side, both, or neither. Same "absolute gates, no
+# corroboration score" shape as earlier filters in this file: the
+# attacking side's own record has to show a genuinely strong attack,
+# the defending side's own record has to show a genuinely leaky
+# defense, and the blended projection for the attacking side (see
+# _expected_goals) has to back the claim up on its own terms.
+#
+# Goals-based gates are always required. xG / shots-on-target gates
+# only apply when that data exists for the team — lower leagues often
+# have no xG, and a missing number shouldn't block an otherwise clear
+# mismatch (the message shows N/A so it's visible).
 #
 # NOTE ON CONFIDENCE: same disclaimer as every version of this file —
 # every threshold below is a heuristic cutoff, not a measured
 # probability.
 
-STRICT_UNDER_GOALS_LINE = 3.5
+ATTACK_TEAM_GOALS_LINE = 1.5
 
-# Hard gates — ALL must hold, no partial credit, no scoring layer.
-STRICT_MAX_EXPECTED_COMBINED_GOALS = 2.0
-STRICT_OWN_GOALS_SANITY_MAX = 1.2
-STRICT_MAX_OWN_CONCEDED = 1.0
+# Strong attack — attacking side's own "for" numbers.
+STRONG_ATTACK_MIN_GOALS = 1.8
+STRONG_ATTACK_MIN_XG = 1.6
+STRONG_ATTACK_MIN_SOT = 5.0
+
+# Weak defense — defending side's own "against" numbers.
+WEAK_DEFENSE_MIN_CONCEDED = 1.6
+WEAK_DEFENSE_MIN_XGA = 1.5
+WEAK_DEFENSE_MIN_SOT_AGAINST = 5.0
+
+# Blended projection for the attacking side must clear this.
+ATTACK_MIN_EXPECTED_GOALS = 1.8
 
 
-def evaluate_strict_under_goals_signal(home, away, home_data, away_data, m_url):
+def _check_attack_vs_defense(att, dfn):
     """
-    Returns a Telegram-ready message if BOTH sides' own raw scoring and
-    conceding records independently support a tight, low-scoring game
-    (STRICT_OWN_GOALS_SANITY_MAX / STRICT_MAX_OWN_CONCEDED) AND the
-    combined projected output (see _expected_goals) sits far below
-    STRICT_UNDER_GOALS_LINE (STRICT_MAX_EXPECTED_COMBINED_GOALS) — or
-    None otherwise. Match-level, not directional — neither side is
-    singled out. No corroboration score — these absolute gates are
-    the whole check.
+    Returns True if every strong-attack / weak-defense gate passes,
+    None otherwise. `att` / `dfn` are the stats dicts of the
+    attacking and defending side respectively.
     """
-    home = _escape_markdown(home)
-    away = _escape_markdown(away)
+    att_g = att.get("avg_goals")
+    dfn_gc = dfn.get("avg_gc")
+    if att_g is None or dfn_gc is None:
+        return None
 
-    hs = home_data["stats"]
-    as_ = away_data["stats"]
+    if att_g < STRONG_ATTACK_MIN_GOALS:
+        return None
+    if dfn_gc < WEAK_DEFENSE_MIN_CONCEDED:
+        return None
+
+    att_xg = att.get("avg_xg")
+    if att_xg is not None and att_xg < STRONG_ATTACK_MIN_XG:
+        return None
+
+    att_sot = att.get("avg_sot_for")
+    if att_sot is not None and att_sot < STRONG_ATTACK_MIN_SOT:
+        return None
+
+    dfn_xga = dfn.get("avg_xga")
+    if dfn_xga is not None and dfn_xga < WEAK_DEFENSE_MIN_XGA:
+        return None
+
+    dfn_sot_against = dfn.get("avg_sot_against")
+    if dfn_sot_against is not None and dfn_sot_against < WEAK_DEFENSE_MIN_SOT_AGAINST:
+        return None
+
+    return True
+
+
+def evaluate_attack_vs_defense_signal(
+    att_name, dfn_name, att_data, dfn_data, att_is_home, m_url
+):
+    """
+    Returns a Telegram-ready message if the attacking side's own record
+    shows a strong attack (STRONG_ATTACK_*), the defending side's own
+    record shows a weak defense (WEAK_DEFENSE_*), AND the attacking
+    side's blended projection (see _expected_goals) clears
+    ATTACK_MIN_EXPECTED_GOALS — or None otherwise.
+    """
+    att_esc = _escape_markdown(att_name)
+    dfn_esc = _escape_markdown(dfn_name)
+
+    ats = att_data["stats"]
+    dfs = dfn_data["stats"]
 
     if (
-        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
-        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
+        ats.get("matches", 0) < MIN_SAMPLE_MATCHES
+        or dfs.get("matches", 0) < MIN_SAMPLE_MATCHES
     ):
         return None
 
-    home_g, away_g = hs.get("avg_goals"), as_.get("avg_goals")
-    home_gc, away_gc = hs.get("avg_gc"), as_.get("avg_gc")
-
-    if None in (home_g, away_g, home_gc, away_gc):
+    if not _check_attack_vs_defense(ats, dfs):
         return None
 
-    if home_g > STRICT_OWN_GOALS_SANITY_MAX or away_g > STRICT_OWN_GOALS_SANITY_MAX:
-        return None
+    if att_is_home:
+        expected_att, expected_dfn, basis = _expected_goals(ats, dfs)
+    else:
+        expected_dfn, expected_att, basis = _expected_goals(dfs, ats)
 
-    if home_gc > STRICT_MAX_OWN_CONCEDED or away_gc > STRICT_MAX_OWN_CONCEDED:
-        return None
-
-    expected_home, expected_away, basis = _expected_goals(hs, as_)
-    expected_combined = expected_home + expected_away
-
-    if expected_combined > STRICT_MAX_EXPECTED_COMBINED_GOALS:
+    if expected_att < ATTACK_MIN_EXPECTED_GOALS:
         return None
 
     # -------------------------------------------------
@@ -562,34 +604,39 @@ def evaluate_strict_under_goals_signal(home, away, home_data, away_data, m_url):
 
     risks = []
 
-    home_xgot = hs.get("avg_xgot_for")
-    home_xg = hs.get("avg_xg")
-    if home_xgot is not None and home_xg is not None and home_xgot >= home_xg + 0.3:
+    att_g = ats.get("avg_goals")
+    att_xg = ats.get("avg_xg")
+    if att_xg is not None and att_g >= att_xg + 0.5:
         risks.append(
-            f"{home} has been clinical when it does get a chance "
-            f"(xGOT {home_xgot} vs xG {home_xg}) — capable of making a "
-            f"low volume of shots count"
+            f"{att_esc} has been over-performing its chances (goals "
+            f"{att_g} vs xG {att_xg}) — finishing may cool off"
         )
 
-    away_xgot = as_.get("avg_xgot_for")
-    away_xg = as_.get("avg_xg")
-    if away_xgot is not None and away_xg is not None and away_xgot >= away_xg + 0.3:
+    dfn_gc = dfs.get("avg_gc")
+    dfn_xga = dfs.get("avg_xga")
+    if dfn_xga is not None and dfn_gc >= dfn_xga + 0.5:
         risks.append(
-            f"{away} has been clinical when it does get a chance "
-            f"(xGOT {away_xgot} vs xG {away_xg}) — capable of making a "
-            f"low volume of shots count"
+            f"{dfn_esc} has conceded more than the chances allowed "
+            f"(GA {dfn_gc} vs xGA {dfn_xga}) — defense may be better "
+            f"than the goals suggest"
         )
 
-    home_corners = hs.get("avg_corners_for")
-    away_corners = as_.get("avg_corners_for")
-    if home_corners is not None and away_corners is not None:
-        combined_corners = home_corners + away_corners
-        if combined_corners >= 11.0:
-            risks.append(
-                f"Combined corners are fairly high ({combined_corners:.1f}) "
-                f"— set-piece goal risk isn't fully captured by the "
-                f"open-play projection above"
-            )
+    att_bc = ats.get("avg_big_chances_for")
+    if att_bc is not None and att_bc < 1.5:
+        risks.append(
+            f"{att_esc} creates few big chances ({att_bc} per game) — "
+            f"output leans on lower-quality shots"
+        )
+
+    dfn_g = dfs.get("avg_goals")
+    if dfn_g is not None and dfn_g >= 1.5:
+        risks.append(
+            f"{dfn_esc} scores freely itself ({dfn_g} per game) — could "
+            f"turn into an open game rather than one-way traffic"
+        )
+
+    if att_xg is None or dfn_xga is None:
+        risks.append("xG data missing for one side — goals-only check")
 
     # -------------------------------------------------
     # MESSAGE
@@ -598,171 +645,29 @@ def evaluate_strict_under_goals_signal(home, away, home_data, away_data, m_url):
     def fmt(v):
         return "N/A" if v is None else str(v)
 
-    lines = [
-        f"🔒🔒 *{home} vs {away}*",
-        "",
-        f"🎯 *Prediction: Under {STRICT_UNDER_GOALS_LINE} total goals* "
-        f"— going OVER would be a massive surprise",
-        f"Projected combined ~{expected_combined:.2f} "
-        f"({home} ~{expected_home:.2f} + {away} ~{expected_away:.2f}, "
-        f"{basis})",
-        "",
-        "📊 *Stats*",
-        f"{home}   G {fmt(hs.get('avg_goals'))} | "
-        f"GA {fmt(hs.get('avg_gc'))} | "
-        f"xG {fmt(hs.get('avg_xg'))} | "
-        f"xGA {fmt(hs.get('avg_xga'))} | "
-        f"Shots {fmt(hs.get('avg_shots_for'))} | "
-        f"SoT {fmt(hs.get('avg_sot_for'))} | "
-        f"BigCh {fmt(hs.get('avg_big_chances_for'))}",
-        f"{away}   G {fmt(as_.get('avg_goals'))} | "
-        f"GA {fmt(as_.get('avg_gc'))} | "
-        f"xG {fmt(as_.get('avg_xg'))} | "
-        f"xGA {fmt(as_.get('avg_xga'))} | "
-        f"Shots {fmt(as_.get('avg_shots_for'))} | "
-        f"SoT {fmt(as_.get('avg_sot_for'))} | "
-        f"BigCh {fmt(as_.get('avg_big_chances_for'))}",
-        "",
-    ]
-
-    if risks:
-        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
-        lines.extend(f"• {r}" for r in risks)
-        lines.append("")
-
-    lines.append(f"🔗 {m_url}")
-
-    return "\n".join(lines)
-
-
-# ---------------- STRICT OVER 1.5 GOALS SIGNAL ENGINE ----------------
-#
-# A second, independent signal alongside the strict under-3.5 one
-# above — added, not a replacement. Match-level, not team-directional.
-# The mirror-image claim: this time the combined projected output has
-# to sit comfortably ABOVE 1.5, not below it — going UNDER would be
-# the shock. Same "absolute gates, no corroboration score" shape:
-# both teams' own raw scoring records independently show at least
-# some attacking life (guards against a genuine 0-0/1-0 risk that a
-# single blended number could paper over), their combined raw scoring
-# history backs up the claim on its own terms, and the combined
-# projected output clears 1.5 by a real margin, not a thin one.
-#
-# NOTE ON CONFIDENCE: same disclaimer as every version of this file —
-# every threshold below is a heuristic cutoff, not a measured
-# probability.
-
-STRICT_OVER_GOALS_LINE = 1.5
-
-# Hard gates — ALL must hold, no partial credit, no scoring layer.
-STRICT_MIN_EXPECTED_COMBINED_GOALS = 2.3
-STRICT_OVER_OWN_GOALS_MIN = 0.6
-STRICT_OVER_COMBINED_OWN_GOALS_MIN = 1.8
-
-
-def evaluate_strict_over_goals_signal(home, away, home_data, away_data, m_url):
-    """
-    Returns a Telegram-ready message if BOTH sides' own raw scoring
-    averages independently show at least some attacking life
-    (STRICT_OVER_OWN_GOALS_MIN each), their combined raw scoring
-    record clears STRICT_OVER_COMBINED_OWN_GOALS_MIN on its own terms,
-    AND the combined projected output (see _expected_goals) clears
-    STRICT_MIN_EXPECTED_COMBINED_GOALS — or None otherwise. Match-
-    level, not directional — neither side is singled out. No
-    corroboration score — these absolute gates are the whole check.
-    """
-    home = _escape_markdown(home)
-    away = _escape_markdown(away)
-
-    hs = home_data["stats"]
-    as_ = away_data["stats"]
-
-    if (
-        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
-        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
-    ):
-        return None
-
-    home_g, away_g = hs.get("avg_goals"), as_.get("avg_goals")
-
-    if home_g is None or away_g is None:
-        return None
-
-    if home_g < STRICT_OVER_OWN_GOALS_MIN or away_g < STRICT_OVER_OWN_GOALS_MIN:
-        return None
-
-    if (home_g + away_g) < STRICT_OVER_COMBINED_OWN_GOALS_MIN:
-        return None
-
-    expected_home, expected_away, basis = _expected_goals(hs, as_)
-    expected_combined = expected_home + expected_away
-
-    if expected_combined < STRICT_MIN_EXPECTED_COMBINED_GOALS:
-        return None
-
-    # -------------------------------------------------
-    # RISK FACTORS (shown, don't block the prediction)
-    # -------------------------------------------------
-
-    risks = []
-
-    home_xg = hs.get("avg_xg")
-    if home_xg is not None and home_g <= home_xg - 0.3:
-        risks.append(
-            f"{home} has been wasteful in front of goal (goals "
-            f"{home_g} vs xG {home_xg}) — actual output has lagged "
-            f"its own chance quality"
-        )
-
-    away_xg = as_.get("avg_xg")
-    if away_xg is not None and away_g <= away_xg - 0.3:
-        risks.append(
-            f"{away} has been wasteful in front of goal (goals "
-            f"{away_g} vs xG {away_xg}) — actual output has lagged "
-            f"its own chance quality"
-        )
-
-    home_gc = hs.get("avg_gc")
-    away_gc = as_.get("avg_gc")
-    if home_gc is not None and away_gc is not None:
-        if (home_gc + away_gc) <= 1.4:
-            risks.append(
-                f"Both defenses have been tight generally (combined GA "
-                f"{home_gc + away_gc:.1f}) — a rare low-scoring day is "
-                f"possible despite the projection above"
-            )
-
-    # -------------------------------------------------
-    # MESSAGE
-    # -------------------------------------------------
-
-    def fmt(v):
-        return "N/A" if v is None else str(v)
+    venue = "home" if att_is_home else "away"
 
     lines = [
-        f"📈📈 *{home} vs {away}*",
+        f"⚔️ *{att_esc} ({venue}) attack vs {dfn_esc} defense*",
         "",
-        f"🎯 *Prediction: Over {STRICT_OVER_GOALS_LINE} total goals* "
-        f"— going UNDER would be a shock",
-        f"Projected combined ~{expected_combined:.2f} "
-        f"({home} ~{expected_home:.2f} + {away} ~{expected_away:.2f}, "
-        f"{basis})",
+        f"🎯 *Prediction: {att_esc} Over {ATTACK_TEAM_GOALS_LINE} team goals*",
+        f"Projected {att_esc} ~{expected_att:.2f} vs "
+        f"{dfn_esc} ~{expected_dfn:.2f} ({basis})",
         "",
-        "📊 *Stats*",
-        f"{home}   G {fmt(hs.get('avg_goals'))} | "
-        f"GA {fmt(hs.get('avg_gc'))} | "
-        f"xG {fmt(hs.get('avg_xg'))} | "
-        f"xGA {fmt(hs.get('avg_xga'))} | "
-        f"Shots {fmt(hs.get('avg_shots_for'))} | "
-        f"SoT {fmt(hs.get('avg_sot_for'))} | "
-        f"BigCh {fmt(hs.get('avg_big_chances_for'))}",
-        f"{away}   G {fmt(as_.get('avg_goals'))} | "
-        f"GA {fmt(as_.get('avg_gc'))} | "
-        f"xG {fmt(as_.get('avg_xg'))} | "
-        f"xGA {fmt(as_.get('avg_xga'))} | "
-        f"Shots {fmt(as_.get('avg_shots_for'))} | "
-        f"SoT {fmt(as_.get('avg_sot_for'))} | "
-        f"BigCh {fmt(as_.get('avg_big_chances_for'))}",
+        f"💥 *{att_esc} attack*",
+        f"G {fmt(ats.get('avg_goals'))} | "
+        f"xG {fmt(ats.get('avg_xg'))} | "
+        f"Shots {fmt(ats.get('avg_shots_for'))} | "
+        f"SoT {fmt(ats.get('avg_sot_for'))} | "
+        f"BigCh {fmt(ats.get('avg_big_chances_for'))} | "
+        f"Poss {fmt(ats.get('avg_possession'))}",
+        "",
+        f"🧱 *{dfn_esc} defense*",
+        f"GA {fmt(dfs.get('avg_gc'))} | "
+        f"xGA {fmt(dfs.get('avg_xga'))} | "
+        f"Shots vs {fmt(dfs.get('avg_shots_against'))} | "
+        f"SoT vs {fmt(dfs.get('avg_sot_against'))} | "
+        f"BigCh vs {fmt(dfs.get('avg_big_chances_against'))}",
         "",
     ]
 
@@ -818,13 +723,13 @@ def main():
         return
 
     send_job_status(
-        f"🚀 Job STARTED (soccer strict under-3.5-goals + strict over-1.5-goals alert)\n"
+        f"🚀 Job STARTED (soccer strong-attack-vs-weak-defense alert)\n"
         f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
     )
 
-    log.info("Starting 365scores strict under-3.5-goals alert script...")
+    log.info("Starting 365scores strong-attack-vs-weak-defense alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     scraper = None
@@ -855,7 +760,7 @@ def main():
             log.info("No matches in this batch.")
 
             send_job_status(
-                f"⚠️ Strict under-3.5-goals alert FINISHED (No matches)\n"
+                f"⚠️ Strong-attack-vs-weak-defense alert FINISHED (No matches)\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, 0 fell in this "
                 f"batch's range",
@@ -922,27 +827,30 @@ def main():
 
                     analyzed_count += 1
 
-                    strict_under_msg = evaluate_strict_under_goals_signal(
+                    home_attack_msg = evaluate_attack_vs_defense_signal(
                         home,
                         away,
                         home_data,
                         away_data,
+                        True,
                         m_url
                     )
 
-                    strict_over_msg = evaluate_strict_over_goals_signal(
-                        home,
+                    away_attack_msg = evaluate_attack_vs_defense_signal(
                         away,
-                        home_data,
+                        home,
                         away_data,
+                        home_data,
+                        False,
                         m_url
                     )
 
-                    # Independent signals — a match can fire either,
-                    # both, or neither; each is sent as its own alert.
+                    # Checked both directions — a match can fire for
+                    # either side, both, or neither; each is sent as
+                    # its own alert.
                     fired_signals = [
-                        ("strict under 3.5 goals", strict_under_msg),
-                        ("strict over 1.5 goals", strict_over_msg),
+                        (f"{home} attack vs {away} defense", home_attack_msg),
+                        (f"{away} attack vs {home} defense", away_attack_msg),
                     ]
 
                     any_fired = False
@@ -973,7 +881,7 @@ def main():
             )
 
             send_job_status(
-                f"✅ Strict under-3.5-goals alert FINISHED\n"
+                f"✅ Strong-attack-vs-weak-defense alert FINISHED\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, analyzed "
                 f"{analyzed_count}/{len(batch_matches)} in this batch",
@@ -983,11 +891,11 @@ def main():
 
     except Exception as e:
 
-        log.error(f"Strict under-3.5-goals alert job failed: {e}")
+        log.error(f"Strong-attack-vs-weak-defense alert job failed: {e}")
         log.error(traceback.format_exc())
 
         send_job_status(
-            f"❌ Strict under-3.5-goals alert FAILED\n"
+            f"❌ Strong-attack-vs-weak-defense alert FAILED\n"
             f"Batch START={START} LIMIT={LIMIT}\n"
             f"Found {len(matches)} matches today, analyzed "
             f"{analyzed_count} before failing\n"
