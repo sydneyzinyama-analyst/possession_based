@@ -12,7 +12,7 @@ import requests
 # Scheduler stdout is frequently not captured/visible, so we always
 # write to a log file as well as stdout. Override the path with
 # SCRAPER_LOG_PATH if you want logs somewhere specific.
-LOG_PATH = os.getenv("SCRAPER_LOG_PATH", "flashscore_possession_dominance_alert.log")
+LOG_PATH = os.getenv("SCRAPER_LOG_PATH", "match_stats_alert.log")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,22 +22,23 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-log = logging.getLogger("flashscore_possession_dominance")
+log = logging.getLogger("match_stats_alert")
 
 
 # ---------------- TUNABLES ----------------
-# Same 365scores.com JSON API (webws.365scores.com/web/...) as every
-# earlier version of this scraper — plain, unauthenticated
-# requests.get() calls work directly against it, no browser/session
-# needed.
+# 365scores.com JSON API (webws.365scores.com/web/...) — plain,
+# unauthenticated requests.get() calls work directly against it, no
+# browser/session needed.
 REQUEST_TIMEOUT_SEC = int(os.getenv("SCRAPER_REQUEST_TIMEOUT_SEC", "20"))
 MAX_RETRIES = int(os.getenv("SCRAPER_MAX_RETRIES", "3"))
 RETRY_BACKOFF_SEC = float(os.getenv("SCRAPER_RETRY_BACKOFF_SEC", "1.5"))
-DISCOVER_TIME_BUDGET_SEC = int(os.getenv("SCRAPER_DISCOVER_BUDGET_SEC", "60"))
 
 # How many of each team's own recent finished matches to analyze.
 TEAM_SAMPLE_MATCHES = 6
 
+# Telegram allows roughly one message per second per chat; since this
+# script sends one message for every match, pace the sends.
+TELEGRAM_SEND_INTERVAL_SEC = float(os.getenv("TELEGRAM_SEND_INTERVAL_SEC", "1.1"))
 
 
 # ---------------- JOB STATUS TELEGRAM ----------------
@@ -51,16 +52,11 @@ def send_job_status(message, bot_token, chat_id):
 
 
 # ---------------- SCRAPER CLASS ----------------
-class SixtyFiveScoresScraper:
+class ThreeSixtyFiveScoresScraper:
     """
     Talks directly to 365scores.com's own internal JSON API
     (webws.365scores.com/web/...) with plain requests calls — no
-    browser, no session establishment, no fingerprinting needed. Data
-    layer unchanged from earlier versions of this script — this
-    filter only needs the regular per-team averages (possession,
-    shots, big chances, xG, ...), so the form-record/latest-match-
-    readout helpers earlier versions added for other filters were
-    dropped as unused.
+    browser, no session establishment, no fingerprinting needed.
     """
 
     BASE_URL = "https://webws.365scores.com/web"
@@ -82,8 +78,7 @@ class SixtyFiveScoresScraper:
             ),
             "Accept": "application/json",
         })
-        self.team_id = None
-        self.team_name = None
+        self._last_telegram_send = 0.0
 
     def _api_get(self, path, params=None, max_retries=None):
         if max_retries is None:
@@ -168,15 +163,6 @@ class SixtyFiveScoresScraper:
 
         if data and data.get("games"):
             for g in data["games"]:
-                if time.time() - t0 > DISCOVER_TIME_BUDGET_SEC:
-                    log.warning(
-                        f"discover_matches hit its "
-                        f"{DISCOVER_TIME_BUDGET_SEC}s time budget with "
-                        f"{len(matches)}/{target_count} found — "
-                        f"stopping early"
-                    )
-                    break
-
                 if len(matches) >= target_count:
                     break
 
@@ -196,6 +182,7 @@ class SixtyFiveScoresScraper:
                     "away_id": away["id"],
                     "away_name": away.get("name", ""),
                     "tournament": g.get("competitionDisplayName", ""),
+                    "start_time": g.get("startTime", ""),
                 })
 
         log.info(
@@ -264,7 +251,7 @@ class SixtyFiveScoresScraper:
 
     def _empty_stat_result(self):
         result = {}
-        for stat_key in set(self.STAT_NAME_MAP.values()) | {"goals_prevented"}:
+        for stat_key in self.STAT_NAME_MAP.values():
             result[f"home_{stat_key}"] = None
             result[f"away_{stat_key}"] = None
         return result
@@ -283,8 +270,7 @@ class SixtyFiveScoresScraper:
                     continue
 
                 competitor_id = item.get("competitorId")
-                raw_value = item.get("value")
-                value = self._parse_stat_value(raw_value)
+                value = self._parse_stat_value(item.get("value"))
                 if value is None:
                     continue
 
@@ -342,34 +328,26 @@ class SixtyFiveScoresScraper:
 
         return round(total / counted, 2)
 
-    def calculate_team_goals(self, results, team_id):
-        total_goals = 0
-        matches_counted = 0
-
+    def _team_form(self, results, team_id):
+        """
+        W/D/L string from the team's point of view, most recent first,
+        in the same order the API returned the matches.
+        """
+        form = []
         for r in results:
             if r.get("home_id") == team_id:
-                total_goals += r.get("home_goals") or 0
-                matches_counted += 1
+                gf, ga = r["home_goals"], r["away_goals"]
             elif r.get("away_id") == team_id:
-                total_goals += r.get("away_goals") or 0
-                matches_counted += 1
+                gf, ga = r["away_goals"], r["home_goals"]
+            else:
+                continue
+            form.append("W" if gf > ga else "L" if gf < ga else "D")
+        return "".join(form)
 
-        avg_goals = (
-            total_goals / matches_counted if matches_counted > 0 else 0
-        )
-
-        return {
-            "team": self.team_name or str(team_id),
-            "total_goals": total_goals,
-            "avg_goals": round(avg_goals, 2),
-            "matches": matches_counted,
-        }
-
-    # ---------------- SCRAPER ----------------
+    # ---------------- TEAM ANALYSIS ----------------
     def analyze_team(self, team_id, team_name=None):
         t0 = time.time()
-        self.team_id = team_id
-        self.team_name = team_name or str(team_id)
+        team_name = team_name or str(team_id)
 
         recent = self.get_team_recent_matches(team_id, count=TEAM_SAMPLE_MATCHES)
         results = []
@@ -382,67 +360,85 @@ class SixtyFiveScoresScraper:
             results.append(match_data)
 
         log.info(
-            f"analyze_team({self.team_name!r}): {len(results)}/"
+            f"analyze_team({team_name!r}): {len(results)}/"
             f"{TEAM_SAMPLE_MATCHES} matches fetched in "
             f"{time.time()-t0:.1f}s total"
         )
 
-        stats = self.calculate_team_goals(results, team_id)
-        avg_gc = self._team_stat_avg(results, "goals", team_id, "against") or 0
-        avg_xg = self._team_stat_avg(results, "xg", team_id, "for")
-        avg_xga = self._team_stat_avg(results, "xg", team_id, "against")
+        avg = lambda stat, side="for": self._team_stat_avg(results, stat, team_id, side)
 
-        avg_gd = round(stats["avg_goals"] - avg_gc, 2)
-
-        if avg_xg is not None and avg_xga is not None:
-            avg_xgd = round(avg_xg - avg_xga, 2)
-        else:
-            avg_xgd = None
-
-        stats.update({
-            "avg_gc": avg_gc,
-            "avg_gd": avg_gd,
-            "avg_xg": avg_xg,
-            "avg_xga": avg_xga,
-            "avg_xgd": avg_xgd,
-            "avg_corners_for": self._team_stat_avg(results, "corners", team_id, "for"),
-            "avg_corners_against": self._team_stat_avg(results, "corners", team_id, "against"),
-            "avg_big_chances_for": self._team_stat_avg(results, "big_chances", team_id, "for"),
-            "avg_big_chances_against": self._team_stat_avg(results, "big_chances", team_id, "against"),
-            "avg_yellow_cards": self._team_stat_avg(results, "yellow_cards", team_id, "for"),
-            "avg_fouls": self._team_stat_avg(results, "fouls", team_id, "for"),
-            "avg_xgot_for": self._team_stat_avg(results, "xgot", team_id, "for"),
-            "avg_xgot_against": self._team_stat_avg(results, "xgot", team_id, "against"),
-            "avg_goals_prevented": self._team_stat_avg(results, "goals_prevented", team_id, "for"),
-            "avg_shots_for": self._team_stat_avg(results, "shots", team_id, "for"),
-            "avg_shots_against": self._team_stat_avg(results, "shots", team_id, "against"),
-            "avg_sot_for": self._team_stat_avg(results, "shots_on_target", team_id, "for"),
-            "avg_sot_against": self._team_stat_avg(results, "shots_on_target", team_id, "against"),
-            "avg_possession": self._team_stat_avg(results, "possession", team_id, "for"),
-        })
+        avg_xg = avg("xg")
+        avg_xga = avg("xg", "against")
 
         return {
-            "team": stats["team"],
+            "team": team_name,
             "team_id": team_id,
-            "matches": [m["id"] for m in recent],
-            "results": results,
-            "stats": stats,
+            "matches": len(results),
+            "form": self._team_form(results, team_id),
+            "avg_goals": avg("goals"),
+            "avg_gc": avg("goals", "against"),
+            "avg_xg": avg_xg,
+            "avg_xga": avg_xga,
+            "avg_xgd": (
+                round(avg_xg - avg_xga, 2)
+                if avg_xg is not None and avg_xga is not None
+                else None
+            ),
+            "avg_xgot_for": avg("xgot"),
+            "avg_xgot_against": avg("xgot", "against"),
+            "avg_possession": avg("possession"),
+            "avg_shots_for": avg("shots"),
+            "avg_shots_against": avg("shots", "against"),
+            "avg_sot_for": avg("shots_on_target"),
+            "avg_sot_against": avg("shots_on_target", "against"),
+            "avg_big_chances_for": avg("big_chances"),
+            "avg_big_chances_against": avg("big_chances", "against"),
+            "avg_corners_for": avg("corners"),
+            "avg_corners_against": avg("corners", "against"),
+            "avg_yellow_cards": avg("yellow_cards"),
+            "avg_fouls": avg("fouls"),
         }
 
     # ---------------- TELEGRAM ----------------
     def send_telegram_message(self, message, bot_token, chat_id):
-        try:
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            payload = {
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "Markdown",
-            }
-            r = requests.post(url, data=payload, timeout=20)
-            if r.status_code != 200:
-                log.warning(f"Telegram error: {r.text}")
-        except Exception as e:
-            log.error(f"Failed to send Telegram message: {e}")
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+        }
+
+        for attempt in range(1, 4):
+            wait = TELEGRAM_SEND_INTERVAL_SEC - (time.time() - self._last_telegram_send)
+            if wait > 0:
+                time.sleep(wait)
+
+            try:
+                r = requests.post(url, data=payload, timeout=20)
+            except Exception as e:
+                log.error(f"Failed to send Telegram message: {e}")
+                return
+            finally:
+                self._last_telegram_send = time.time()
+
+            if r.status_code == 200:
+                return
+
+            if r.status_code == 429:
+                # Rate limited: Telegram says how long to back off.
+                try:
+                    retry_after = r.json()["parameters"]["retry_after"]
+                except Exception:
+                    retry_after = 5
+                log.warning(
+                    f"Telegram rate limit, retrying in {retry_after}s "
+                    f"(attempt {attempt}/3)"
+                )
+                time.sleep(retry_after)
+                continue
+
+            log.warning(f"Telegram error: {r.text}")
+            return
 
     def close(self):
         try:
@@ -451,12 +447,7 @@ class SixtyFiveScoresScraper:
             log.warning(f"Error closing session: {e}")
 
 
-# ---------------- SHARED SIGNAL HELPERS ----------------
-# Generic helpers used by the signal engine below (and any future
-# ones) — not specific to any one signal's claim.
-
-MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
-
+# ---------------- MESSAGE FORMATTING ----------------
 
 def _escape_markdown(text):
     """
@@ -468,206 +459,52 @@ def _escape_markdown(text):
     return re.sub(r"([_*`\[])", r"\\\1", str(text))
 
 
-def _expected_goals(home, away):
+def _fmt(v, suffix=""):
+    return "N/A" if v is None else f"{v}{suffix}"
+
+
+def _team_block(label, s):
     """
-    Blended for+against expected-goals estimate for both sides: xG-
-    based when both sides have full xG/xGA data, a raw-goals fallback
-    otherwise. Returns (expected_home_goals, expected_away_goals,
-    basis) — the one pair of numbers that already combines each
-    side's own attacking rate with the OTHER side's own defensive
-    leakiness, rather than reading either side's stats in isolation.
+    Stats section for one team. `s` is analyze_team()'s return value,
+    or None if that team's analysis failed.
     """
-    home_xg, away_xg = home.get("avg_xg"), away.get("avg_xg")
-    home_xga, away_xga = home.get("avg_xga"), away.get("avg_xga")
+    if s is None:
+        return [f"*{label}*", "   (no data — analysis failed)"]
 
-    if None not in (home_xg, away_xg, home_xga, away_xga):
-        expected_home = (home_xg + away_xga) / 2
-        expected_away = (away_xg + home_xga) / 2
-        basis = "xG-based"
-    else:
-        home_g, away_g = home.get("avg_goals", 0), away.get("avg_goals", 0)
-        home_gc, away_gc = home.get("avg_gc", 0), away.get("avg_gc", 0)
-        expected_home = (home_g + away_gc) / 2
-        expected_away = (away_g + home_gc) / 2
-        basis = "goals-based, no xG data"
-
-    return expected_home, expected_away, basis
-
-
-# ---------------- HOME POSSESSION DOMINANCE SIGNAL ENGINE ----------------
-#
-# Home-team only. Claim: the home side will have the ball and control
-# the game. Same "absolute gates, no corroboration score" shape as
-# earlier filters in this file: the home side's own record has to
-# show it habitually dominates the ball, the away side's own record
-# has to show it habitually cedes it, those have to hold match after
-# match (not one freak 80% game dragging the average up), and the
-# blended projection has to clear the line on its own terms.
-#
-# Possession data is required — unlike xG there is no sensible
-# fallback for it, so a team with no possession numbers never fires.
-#
-# NOTE ON CONFIDENCE: same disclaimer as every version of this file —
-# every threshold below is a heuristic cutoff, not a measured
-# probability.
-
-# Home side's own average possession.
-HOME_MIN_AVG_POSSESSION = 58.0
-# Away side's own average possession.
-AWAY_MAX_AVG_POSSESSION = 48.0
-
-# Consistency: in at least this many of the sampled matches, the home
-# side had >= HOME_DOMINANT_MATCH_POSSESSION and the away side had
-# <= AWAY_CEDING_MATCH_POSSESSION.
-HOME_DOMINANT_MATCH_POSSESSION = 55.0
-AWAY_CEDING_MATCH_POSSESSION = 50.0
-MIN_CONSISTENT_MATCHES = 4
-
-# Blended projection (home avg + 100 - away avg) / 2 must clear this.
-MIN_PROJECTED_HOME_POSSESSION = 58.0
-
-
-def _team_possession_by_match(team_data):
-    """
-    The team's own possession figure in each sampled match that has
-    one, in match order.
-    """
-    team_id = team_data["team_id"]
-    values = []
-    for r in team_data["results"]:
-        if r.get("home_id") == team_id:
-            v = r.get("home_possession")
-        elif r.get("away_id") == team_id:
-            v = r.get("away_possession")
-        else:
-            continue
-        if v is not None:
-            values.append(v)
-    return values
-
-
-def evaluate_home_possession_signal(home, away, home_data, away_data, m_url):
-    """
-    Returns a Telegram-ready message if the home side habitually
-    dominates the ball (HOME_MIN_AVG_POSSESSION, consistent across
-    MIN_CONSISTENT_MATCHES), the away side habitually cedes it
-    (AWAY_MAX_AVG_POSSESSION, same consistency check), AND the blended
-    projection clears MIN_PROJECTED_HOME_POSSESSION — or None
-    otherwise.
-    """
-    home = _escape_markdown(home)
-    away = _escape_markdown(away)
-
-    hs = home_data["stats"]
-    as_ = away_data["stats"]
-
-    if (
-        hs.get("matches", 0) < MIN_SAMPLE_MATCHES
-        or as_.get("matches", 0) < MIN_SAMPLE_MATCHES
-    ):
-        return None
-
-    home_poss = hs.get("avg_possession")
-    away_poss = as_.get("avg_possession")
-    if home_poss is None or away_poss is None:
-        return None
-
-    if home_poss < HOME_MIN_AVG_POSSESSION:
-        return None
-    if away_poss > AWAY_MAX_AVG_POSSESSION:
-        return None
-
-    home_series = _team_possession_by_match(home_data)
-    away_series = _team_possession_by_match(away_data)
-
-    home_dominant = sum(1 for v in home_series if v >= HOME_DOMINANT_MATCH_POSSESSION)
-    away_ceding = sum(1 for v in away_series if v <= AWAY_CEDING_MATCH_POSSESSION)
-
-    if home_dominant < MIN_CONSISTENT_MATCHES:
-        return None
-    if away_ceding < MIN_CONSISTENT_MATCHES:
-        return None
-
-    projected = (home_poss + (100 - away_poss)) / 2
-    if projected < MIN_PROJECTED_HOME_POSSESSION:
-        return None
-
-    # -------------------------------------------------
-    # RISK FACTORS (shown, don't block the prediction)
-    # -------------------------------------------------
-
-    risks = []
-
-    home_shots = hs.get("avg_shots_for")
-    home_bc = hs.get("avg_big_chances_for")
-    if (home_shots is not None and home_shots < 11) or (
-        home_bc is not None and home_bc < 1.5
-    ):
-        risks.append(
-            f"{home}'s possession has been fairly sterile (shots "
-            f"{home_shots if home_shots is not None else 'N/A'}, big "
-            f"chances {home_bc if home_bc is not None else 'N/A'}) — "
-            f"control doesn't guarantee chances"
-        )
-
-    away_g = as_.get("avg_goals")
-    if away_g is not None and away_g >= 1.3:
-        risks.append(
-            f"{away} scores well without the ball ({away_g} per game "
-            f"on {away_poss}% possession) — dangerous on the counter"
-        )
-
-    if home_series and max(home_series) - min(home_series) >= 20:
-        risks.append(
-            f"{home}'s possession swings a lot match to match "
-            f"({min(home_series):.0f}%–{max(home_series):.0f}%)"
-        )
-
-    # -------------------------------------------------
-    # MESSAGE
-    # -------------------------------------------------
-
-    def fmt(v):
-        return "N/A" if v is None else str(v)
-
-    def series(vals):
-        return " / ".join(f"{v:.0f}" for v in vals) or "N/A"
-
-    lines = [
-        f"🎮 *{home} vs {away}*",
-        "",
-        f"🎯 *Prediction: {home} (home) dominates possession*",
-        f"Projected {home} ~{projected:.0f}% of the ball",
-        "",
-        "📊 *Possession*",
-        f"{home}   avg {fmt(home_poss)}% | "
-        f"{home_dominant}/{len(home_series)} games ≥ "
-        f"{HOME_DOMINANT_MATCH_POSSESSION:.0f}%",
-        f"   last games: {series(home_series)}",
-        f"{away}   avg {fmt(away_poss)}% | "
-        f"{away_ceding}/{len(away_series)} games ≤ "
-        f"{AWAY_CEDING_MATCH_POSSESSION:.0f}%",
-        f"   last games: {series(away_series)}",
-        "",
-        "📈 *Stats*",
-        f"{home}   G {fmt(hs.get('avg_goals'))} | "
-        f"GA {fmt(hs.get('avg_gc'))} | "
-        f"xG {fmt(hs.get('avg_xg'))} | "
-        f"Shots {fmt(hs.get('avg_shots_for'))} | "
-        f"Corners {fmt(hs.get('avg_corners_for'))}",
-        f"{away}   G {fmt(as_.get('avg_goals'))} | "
-        f"GA {fmt(as_.get('avg_gc'))} | "
-        f"xG {fmt(as_.get('avg_xg'))} | "
-        f"Shots {fmt(as_.get('avg_shots_for'))} | "
-        f"Corners {fmt(as_.get('avg_corners_for'))}",
-        "",
+    return [
+        f"*{label}*  (last {s['matches']}, form {s['form'] or 'N/A'})",
+        f"   Goals {_fmt(s['avg_goals'])} for / {_fmt(s['avg_gc'])} against",
+        f"   xG {_fmt(s['avg_xg'])} for / {_fmt(s['avg_xga'])} against "
+        f"(xGD {_fmt(s['avg_xgd'])})",
+        f"   xGOT {_fmt(s['avg_xgot_for'])} for / {_fmt(s['avg_xgot_against'])} against",
+        f"   Possession {_fmt(s['avg_possession'], '%')}",
+        f"   Shots {_fmt(s['avg_shots_for'])} for / {_fmt(s['avg_shots_against'])} against",
+        f"   On target {_fmt(s['avg_sot_for'])} for / {_fmt(s['avg_sot_against'])} against",
+        f"   Big chances {_fmt(s['avg_big_chances_for'])} for / "
+        f"{_fmt(s['avg_big_chances_against'])} against",
+        f"   Corners {_fmt(s['avg_corners_for'])} for / {_fmt(s['avg_corners_against'])} against",
+        f"   Yellow cards {_fmt(s['avg_yellow_cards'])} | Fouls {_fmt(s['avg_fouls'])}",
     ]
 
-    if risks:
-        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
-        lines.extend(f"• {r}" for r in risks)
-        lines.append("")
 
+def build_match_message(match, home_data, away_data, m_url):
+    home = _escape_markdown(match["home_name"])
+    away = _escape_markdown(match["away_name"])
+    tournament = _escape_markdown(match.get("tournament") or "")
+    kickoff = match.get("start_time") or ""
+
+    lines = [f"⚽ *{home} vs {away}*"]
+    if tournament:
+        lines.append(f"🏆 {tournament}")
+    if kickoff:
+        # startTime looks like 2026-09-28T19:00:00+02:00
+        lines.append(f"🕒 {kickoff[:16].replace('T', ' ')}")
+    lines.append("")
+    lines.append(f"📈 *Averages per game (last {TEAM_SAMPLE_MATCHES} matches)*")
+    lines.extend(_team_block(f"🏠 {home}", home_data))
+    lines.append("")
+    lines.extend(_team_block(f"✈️ {away}", away_data))
+    lines.append("")
     lines.append(f"🔗 {m_url}")
 
     return "\n".join(lines)
@@ -678,35 +515,16 @@ def evaluate_home_possession_signal(home, away, home_data, away_data, m_url):
 def main():
 
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--start",
-        type=int,
-        default=0
-    )
-
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=100
-    )
-
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=100)
     args = parser.parse_args()
 
     START = max(0, args.start)
     LIMIT = max(1, args.limit)
-
     TARGET_COUNT = START + LIMIT
 
-    BOT_TOKEN = os.getenv(
-        "BOT_TOKEN",
-        ""
-    ).strip()
-
-    CHAT_ID = os.getenv(
-        "CHAT_ID",
-        ""
-    ).strip()
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+    CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
     if not BOT_TOKEN or not CHAT_ID:
         log.error(
@@ -715,180 +533,113 @@ def main():
         return
 
     send_job_status(
-        f"🚀 Job STARTED (soccer home-possession-dominance alert)\n"
+        f"🚀 Job STARTED (soccer match stats alert)\n"
         f"Batch START={START} LIMIT={LIMIT}",
         BOT_TOKEN,
         CHAT_ID
     )
 
-    log.info("Starting 365scores home-possession-dominance alert script...")
+    log.info("Starting 365scores match stats alert script...")
     log.info(f"Batch start={START}, limit={LIMIT}")
 
     scraper = None
     matches = []
-    analyzed_count = 0
+    sent_count = 0
 
     try:
-        scraper = SixtyFiveScoresScraper()
+        scraper = ThreeSixtyFiveScoresScraper()
 
-        matches = scraper.discover_matches(
-            TARGET_COUNT,
-            only_upcoming=True
-        )
-
+        matches = scraper.discover_matches(TARGET_COUNT, only_upcoming=True)
         log.info(f"Found {len(matches)} upcoming matches total")
 
-        batch_matches = matches[
-            START:START + LIMIT
-        ]
-
+        batch_matches = matches[START:START + LIMIT]
         log.info(
             f"This job will process {len(batch_matches)} matches "
             f"from {START} to {START + LIMIT - 1}"
         )
 
         if not batch_matches:
-
             log.info("No matches in this batch.")
-
             send_job_status(
-                f"⚠️ Home-possession-dominance alert FINISHED (No matches)\n"
+                f"⚠️ Match stats alert FINISHED (No matches)\n"
                 f"Batch START={START} LIMIT={LIMIT}\n"
                 f"Found {len(matches)} matches today, 0 fell in this "
                 f"batch's range",
                 BOT_TOKEN,
                 CHAT_ID
             )
+            return
 
-        else:
-
-            for idx, match in enumerate(
-                batch_matches,
-                start=START + 1
-            ):
-
-                m_url = f"https://www.365scores.com/en-uk/football/game/{match['id']}"
-                home = match["home_name"]
-                away = match["away_name"]
-
-                log.info(
-                    f"Processing match {idx}: {home} vs {away} "
-                    f"({match.get('tournament', '')}) {m_url}"
-                )
-
-                try:
-                    if not home or not away:
-                        log.warning(
-                            "Could not extract teams, skipping match"
-                        )
-                        continue
-
-                    home_error = None
-                    away_error = None
-
-                    try:
-                        home_data = scraper.analyze_team(
-                            match["home_id"], match["home_name"]
-                        )
-                    except Exception as e:
-                        home_data = None
-                        home_error = e
-
-                    try:
-                        away_data = scraper.analyze_team(
-                            match["away_id"], match["away_name"]
-                        )
-                    except Exception as e:
-                        away_data = None
-                        away_error = e
-
-                    if home_error:
-                        log.error(f"Home team analysis failed: {home_error}")
-
-                    if away_error:
-                        log.error(f"Away team analysis failed: {away_error}")
-
-                    if not home_data or not away_data:
-
-                        log.warning(
-                            "Could not analyze one or both teams, "
-                            "skipping match"
-                        )
-
-                        continue
-
-                    analyzed_count += 1
-
-                    home_poss_msg = evaluate_home_possession_signal(
-                        home,
-                        away,
-                        home_data,
-                        away_data,
-                        m_url
-                    )
-
-                    fired_signals = [
-                        ("home possession dominance", home_poss_msg),
-                    ]
-
-                    any_fired = False
-
-                    for label, sig_msg in fired_signals:
-                        if sig_msg:
-                            any_fired = True
-                            log.info(f"ALERT ({label}):\n" + sig_msg)
-                            scraper.send_telegram_message(
-                                sig_msg,
-                                BOT_TOKEN,
-                                CHAT_ID
-                            )
-
-                    if not any_fired:
-                        log.info("No signals found.")
-
-                except Exception as match_err:
-                    log.error(
-                        f"Error processing match {m_url}: {match_err}"
-                    )
-                    log.debug(traceback.format_exc())
-                    continue
+        for idx, match in enumerate(batch_matches, start=START + 1):
+            m_url = f"https://www.365scores.com/en-uk/football/game/{match['id']}"
+            home = match["home_name"]
+            away = match["away_name"]
 
             log.info(
-                f"Analyzed {analyzed_count}/{len(batch_matches)} matches "
-                f"in this batch (found {len(matches)} total today)"
+                f"Processing match {idx}: {home} vs {away} "
+                f"({match.get('tournament', '')}) {m_url}"
             )
 
-            send_job_status(
-                f"✅ Home-possession-dominance alert FINISHED\n"
-                f"Batch START={START} LIMIT={LIMIT}\n"
-                f"Found {len(matches)} matches today, analyzed "
-                f"{analyzed_count}/{len(batch_matches)} in this batch",
-                BOT_TOKEN,
-                CHAT_ID
-            )
+            try:
+                if not home or not away:
+                    log.warning("Could not extract teams, skipping match")
+                    continue
+
+                # A failed side still gets sent, shown as "no data".
+                try:
+                    home_data = scraper.analyze_team(match["home_id"], home)
+                except Exception as e:
+                    log.error(f"Home team analysis failed: {e}")
+                    home_data = None
+
+                try:
+                    away_data = scraper.analyze_team(match["away_id"], away)
+                except Exception as e:
+                    log.error(f"Away team analysis failed: {e}")
+                    away_data = None
+
+                msg = build_match_message(match, home_data, away_data, m_url)
+                log.info("MATCH STATS:\n" + msg)
+                scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
+                sent_count += 1
+
+            except Exception as match_err:
+                log.error(f"Error processing match {m_url}: {match_err}")
+                log.debug(traceback.format_exc())
+                continue
+
+        log.info(
+            f"Sent {sent_count}/{len(batch_matches)} matches "
+            f"in this batch (found {len(matches)} total today)"
+        )
+
+        send_job_status(
+            f"✅ Match stats alert FINISHED\n"
+            f"Batch START={START} LIMIT={LIMIT}\n"
+            f"Found {len(matches)} matches today, sent "
+            f"{sent_count}/{len(batch_matches)} in this batch",
+            BOT_TOKEN,
+            CHAT_ID
+        )
 
     except Exception as e:
-
-        log.error(f"Home-possession-dominance alert job failed: {e}")
+        log.error(f"Match stats alert job failed: {e}")
         log.error(traceback.format_exc())
 
         send_job_status(
-            f"❌ Home-possession-dominance alert FAILED\n"
+            f"❌ Match stats alert FAILED\n"
             f"Batch START={START} LIMIT={LIMIT}\n"
-            f"Found {len(matches)} matches today, analyzed "
-            f"{analyzed_count} before failing\n"
+            f"Found {len(matches)} matches today, sent "
+            f"{sent_count} before failing\n"
             f"Error: {str(e)}",
             BOT_TOKEN,
             CHAT_ID
         )
 
     finally:
-
         log.info("Closing scraper session...")
-
         if scraper is not None:
             scraper.close()
-
 
 
 if __name__ == "__main__":
