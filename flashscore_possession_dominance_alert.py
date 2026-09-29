@@ -61,10 +61,11 @@ TELEGRAM_SEND_INTERVAL_SEC = float(os.getenv("TELEGRAM_SEND_INTERVAL_SEC", "1.1"
 MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
 
 # Standard match-total goal lines to check — the classic Over/Under
-# markets. A match can clear the alert bar on more than one line at
-# once (e.g. Under 3.5 at 92% and Under 2.5 at 87%); every qualifying
-# line is shown, not just the single best one.
-GOAL_LINES = (1.5, 2.5, 3.5)
+# markets, from Over 0.5 (basically "will anyone score") up to Under
+# 5.5 (a goal-fest is unlikely). A match can clear the alert bar on
+# more than one line at once (e.g. Under 4.5 at 96% and Under 3.5 at
+# 89%); every qualifying line is shown, not just the single best one.
+GOAL_LINES = (0.5, 1.5, 2.5, 3.5, 4.5, 5.5)
 
 # Only alert when a line's probability (either side) clears this bar.
 # 0.85 = 85%, per explicit request. Env-overridable, matching this
