@@ -41,28 +41,33 @@ TEAM_SAMPLE_MATCHES = 6
 # script sends one message for every match, pace the sends.
 TELEGRAM_SEND_INTERVAL_SEC = float(os.getenv("TELEGRAM_SEND_INTERVAL_SEC", "1.1"))
 
-# ---------------- TEAM TO SCORE 1+ SIGNAL ----------------
-# Deterministic math, not a judgment call: each team's expected goals
-# (see _expected_goals) feed a Poisson model's probability of scoring
-# zero goals (P(0) = e^-lambda, the Poisson PMF at k=0), so
-# P(scores >= 1) = 1 - e^-lambda. Checked independently per team — a
-# match can qualify for the home side, the away side, both, or
-# neither.
+# ---------------- MATCH UNDER 3.5 GOALS SIGNAL ----------------
+# Deterministic math, not a judgment call: both teams' expected goals
+# (see _expected_goals) are summed into one match-total rate, which
+# feeds a Poisson model's P(total <= 3) — the Poisson CDF at k=3 is
+# exactly P(Under 3.5), since 3.5 sits between the integers 3 and 4
+# with no push case to worry about.
 #
 # NOTE: a calculated 90% doesn't guarantee it's *right* 90% of the
-# time, only that the Poisson math was done correctly on the inputs
-# it was given — this file's history already has two prior filters
-# that looked reasonable and were swapped out (an Over/Under Poisson
-# model, then a strong-attack-vs-weak-defense matchup filter); this
-# one needs the same real-result check (match_stats_backtest.py)
-# before the ALERT_PROBABILITY_THRESHOLD bar can be trusted as-is.
+# time, only that the Poisson math was done correctly on the inputs it
+# was given — this file's history already has two prior filters that
+# looked reasonable and were swapped out (an Over/Under Poisson model
+# across several lines, then a team-to-score-1+ signal, then a
+# strong-attack-vs-weak-defense matchup filter before that); this one
+# needs the same real-result check (match_stats_backtest.py) before
+# the ALERT_PROBABILITY_THRESHOLD bar can be trusted as-is.
 
 MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
 
-# Only alert when a team's probability of scoring clears this bar.
-# 0.90 = 90%, per explicit request. Env-overridable, matching this
-# file's existing tunable style.
+# Only alert when the match's P(Under 3.5) clears this bar. 0.90 = 90%,
+# per explicit request. Env-overridable, matching this file's existing
+# tunable style.
 ALERT_PROBABILITY_THRESHOLD = float(os.getenv("ALERT_PROBABILITY_THRESHOLD", "0.90"))
+
+# The fixed line this signal checks — Under 3.5 goals, per explicit
+# request. (Not the same GOAL_LINES-sweep shape as the earlier,
+# removed Over/Under model; this one only ever checks this one line.)
+GOAL_LINE = 3.5
 
 
 def _expected_goals(home_data, away_data):
@@ -85,17 +90,27 @@ def _expected_goals(home_data, away_data):
     return (h_g + a_gc) / 2, (a_g + h_gc) / 2, "goals-based, no xG data"
 
 
-def _prob_scores_at_least_one(expected_goals):
-    """P(a team with this many expected goals scores >= 1) = 1 - e^-lambda (Poisson PMF at k=0 is e^-lambda)."""
-    return 1 - math.exp(-expected_goals)
+def _poisson_pmf(k, lam):
+    """P(exactly k) for a Poisson(lam) variable. Pure math.exp/factorial — no numpy needed."""
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
-def evaluate_team_to_score_signal(home, away, home_data, away_data, m_url):
+def _poisson_cdf(k, lam):
+    """P(X <= k) for a Poisson(lam) variable, by summing the PMF up to k."""
+    return sum(_poisson_pmf(i, lam) for i in range(k + 1))
+
+
+def _prob_under(expected_total, line):
+    """P(Under `line`) for a Poisson(expected_total) match-total — line is always X.5, so this is exact (no push)."""
+    return _poisson_cdf(int(line), expected_total)
+
+
+def evaluate_under_3_5_signal(home, away, home_data, away_data, m_url):
     """
-    Returns a Telegram-ready message if either team's probability of
-    scoring at least 1 goal clears ALERT_PROBABILITY_THRESHOLD, or
-    None if neither does (or either team's sample is too thin to
-    trust).
+    Returns a Telegram-ready message if this match's combined-goals
+    Poisson model puts P(Under 3.5) at or above
+    ALERT_PROBABILITY_THRESHOLD, or None if it doesn't (or either
+    team's sample is too thin to trust).
     """
     if (
         (home_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
@@ -104,37 +119,24 @@ def evaluate_team_to_score_signal(home, away, home_data, away_data, m_url):
         return None
 
     expected_home, expected_away, basis = _expected_goals(home_data, away_data)
-    p_home = _prob_scores_at_least_one(expected_home)
-    p_away = _prob_scores_at_least_one(expected_away)
+    expected_total = expected_home + expected_away
+    p_under = _prob_under(expected_total, GOAL_LINE)
 
-    qualifying = []
-    if p_home >= ALERT_PROBABILITY_THRESHOLD:
-        qualifying.append((home, expected_home, p_home))
-    if p_away >= ALERT_PROBABILITY_THRESHOLD:
-        qualifying.append((away, expected_away, p_away))
-
-    if not qualifying:
+    if p_under < ALERT_PROBABILITY_THRESHOLD:
         return None
-
-    qualifying.sort(key=lambda x: x[2], reverse=True)
 
     home_esc = _escape_markdown(home)
     away_esc = _escape_markdown(away)
 
     lines = [
         f"🎯 *{home_esc} vs {away_esc}*",
-        f"Goals model ({basis}): expected {expected_home:.2f} (home) / "
-        f"{expected_away:.2f} (away)",
+        f"Goals model ({basis}): expected {expected_home:.2f} + "
+        f"{expected_away:.2f} = {expected_total:.2f} total",
         "",
-        "📊 *Team to score 1+ goal*",
+        f"📊 *Under {GOAL_LINE} goals — {p_under*100:.1f}% probability*",
+        "",
+        f"🔗 {m_url}",
     ]
-    for team, lam, prob in qualifying:
-        lines.append(
-            f"   {_escape_markdown(team)} — {prob*100:.1f}% probability "
-            f"(expected {lam:.2f} goals)"
-        )
-    lines.append("")
-    lines.append(f"🔗 {m_url}")
 
     return "\n".join(lines)
 
@@ -695,12 +697,12 @@ def main():
                     log.error(f"Away team analysis failed: {e}")
                     away_data = None
 
-                tts_msg = evaluate_team_to_score_signal(home, away, home_data, away_data, m_url)
-                if not tts_msg:
-                    log.info("No team-to-score signal — not alerting.")
+                u35_msg = evaluate_under_3_5_signal(home, away, home_data, away_data, m_url)
+                if not u35_msg:
+                    log.info("No Under 3.5 signal — not alerting.")
                     continue
 
-                msg = tts_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
+                msg = u35_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
                 log.info("MATCH STATS:\n" + msg)
                 scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
                 sent_count += 1
