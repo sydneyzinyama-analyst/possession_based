@@ -2,7 +2,6 @@ import os
 import sys
 import argparse
 import logging
-import math
 import time
 import re
 import traceback
@@ -41,76 +40,87 @@ TEAM_SAMPLE_MATCHES = 6
 # script sends one message for every match, pace the sends.
 TELEGRAM_SEND_INTERVAL_SEC = float(os.getenv("TELEGRAM_SEND_INTERVAL_SEC", "1.1"))
 
-# ---------------- OVER/UNDER PROBABILITY MODEL ----------------
-# Deterministic math, not a judgment call: each team's expected goals
-# (see _expected_goals) feed a Poisson model for the combined match
-# total, which gives an exact P(over)/P(under) for any goal line —
-# not a heuristic 0-100 score like flashscore_scraper.py's Predictive
-# Power Score turned out to be (see that file's tennis backtest
-# history for why an untested heuristic score is worth being
-# suspicious of). This number still needs backtesting against real
-# results before the ALERT_PROBABILITY_THRESHOLD bar below can be
-# trusted at face value — a model *calculating* 85% doesn't guarantee
-# it's *right* 85% of the time, only that the Poisson math was done
-# correctly on the inputs it was given.
+# ---------------- STRONG ATTACK vs WEAK DEFENSE SIGNAL ----------------
+# Alerts when one side's own attacking record is genuinely strong AND
+# the side they're facing has a genuinely leaky defensive record — a
+# flagged matchup mismatch, not a predicted scoreline or probability.
+# Uses each side's OWN rate independently (not blended with the
+# opponent's) — "strong attack" and "weak defense" are properties of a
+# team's own record, not something that depends on who they're facing.
+#
+# xG/xGA preferred over raw goals/conceded when available — steadier
+# match-to-match than actual goals, which swings more on finishing
+# variance, same xG-preferred pattern flashscore_scraper.py uses.
+#
+# NOTE: these thresholds are a reasonable starting point (a team
+# netting ~2/game is a clear attacking threat; a team shipping ~1.5+/
+# game has a real defensive problem), but — same lesson as
+# flashscore_scraper.py's tennis Predictive Power Score, which looked
+# reasonable on paper and backtested at 45% (worse than a coin flip)
+# — they haven't been checked against real results yet. Worth
+# backtesting (match_stats_backtest.py) before trusting them as-is.
 
-# Require the full recent-match window before trusting either team's
-# expected-goals input — same "refuse to predict on a thin sample"
-# gate flashscore_scraper.py uses (MIN_SAMPLE_MATCHES == the full
-# fetch target there too, not some fraction of it).
 MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
 
-# Standard match-total goal lines to check — the classic Over/Under
-# markets, from Over 0.5 (basically "will anyone score") up to Under
-# 5.5 (a goal-fest is unlikely). A match can clear the alert bar on
-# more than one line at once (e.g. Under 4.5 at 96% and Under 3.5 at
-# 89%); every qualifying line is shown, not just the single best one.
-GOAL_LINES = (0.5, 1.5, 2.5, 3.5, 4.5, 5.5)
+STRONG_ATTACK_GOALS = 2.0
+WEAK_DEFENSE_GOALS = 1.5
 
-# Only alert when a line's probability (either side) clears this bar.
-# 0.85 = 85%, per explicit request. Env-overridable, matching this
-# file's existing tunable style.
-ALERT_PROBABILITY_THRESHOLD = float(os.getenv("ALERT_PROBABILITY_THRESHOLD", "0.85"))
+# Corroboration bar: how many of the extra attack/defense indicators
+# (shots, shots on target, big chances — attacker's own rate for vs
+# defender's own rate against) have to agree before this fires, out
+# of 3 possible. Guards against a mismatch built on a couple of fluky
+# high-scoring/leaky games rather than a genuine, repeated pattern.
+MISMATCH_SCORE_THRESHOLD = 2
 
 
-def _poisson_pmf(k, lam):
-    """P(exactly k) for a Poisson(lam) variable. Pure math.exp/factorial — no numpy needed."""
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+def _is_strong_attack(team_data):
+    """True if team_data's own scoring rate (xG preferred over goals) clears STRONG_ATTACK_GOALS."""
+    rate = team_data.get("avg_xg")
+    if rate is None:
+        rate = team_data.get("avg_goals")
+    return rate is not None and rate >= STRONG_ATTACK_GOALS
 
 
-def _poisson_cdf(k, lam):
-    """P(X <= k) for a Poisson(lam) variable, by summing the PMF up to k."""
-    return sum(_poisson_pmf(i, lam) for i in range(k + 1))
+def _is_weak_defense(team_data):
+    """True if team_data's own conceding rate (xGA preferred over goals conceded) clears WEAK_DEFENSE_GOALS."""
+    rate = team_data.get("avg_xga")
+    if rate is None:
+        rate = team_data.get("avg_gc")
+    return rate is not None and rate >= WEAK_DEFENSE_GOALS
 
 
-def _expected_goals(home_data, away_data):
+def _mismatch_score(attacker_data, defender_data):
     """
-    Each side's expected goals for this match: own attacking rate
-    blended with the opponent's own defensive leakiness (xG-based when
-    both teams have xG data, goals-based fallback otherwise) — the
-    same "for + opponent's against" blend flashscore_scraper.py uses
-    throughout its signal engine, reused here for consistency rather
-    than inventing a different estimator. Returns
-    (expected_home_goals, expected_away_goals, basis).
+    Corroboration on top of the hard gate: for each of shots/shots-on-
+    target/big-chances, does the attacker create a lot of them AND
+    does the defender concede a lot of them — 0 to 3. None-safe; a
+    missing stat contributes nothing.
     """
-    h_xg, h_xga = home_data.get("avg_xg"), home_data.get("avg_xga")
-    a_xg, a_xga = away_data.get("avg_xg"), away_data.get("avg_xga")
+    score = 0
+    # (attacker's own "for" stat, defender's own "against" stat, bar both must clear)
+    checks = (
+        ("avg_shots_for", "avg_shots_against", 12.0),
+        ("avg_sot_for", "avg_sot_against", 4.5),
+        ("avg_big_chances_for", "avg_big_chances_against", 2.0),
+    )
+    for for_key, against_key, bar in checks:
+        attacker_rate = attacker_data.get(for_key)
+        defender_rate = defender_data.get(against_key)
+        if attacker_rate is not None and defender_rate is not None:
+            if attacker_rate >= bar and defender_rate >= bar:
+                score += 1
+    return score
 
-    if None not in (h_xg, h_xga, a_xg, a_xga):
-        return (h_xg + a_xga) / 2, (a_xg + h_xga) / 2, "xG-based"
 
-    h_g, h_gc = home_data.get("avg_goals") or 0, home_data.get("avg_gc") or 0
-    a_g, a_gc = away_data.get("avg_goals") or 0, away_data.get("avg_gc") or 0
-    return (h_g + a_gc) / 2, (a_g + h_gc) / 2, "goals-based, no xG data"
-
-
-def evaluate_over_under_signal(home, away, home_data, away_data, m_url):
+def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
     """
-    Returns a Telegram-ready message if this match's combined-goals
-    Poisson model clears ALERT_PROBABILITY_THRESHOLD on at least one
-    of GOAL_LINES, or None if it doesn't (or either team's sample is
-    too thin to trust). Every qualifying line is included, most
-    extreme probability first.
+    Returns a Telegram-ready message if either side's strong attacking
+    record is facing the other side's weak defensive record,
+    corroborated by at least MISMATCH_SCORE_THRESHOLD of the shots/
+    SoT/big-chances indicators — or None if neither direction
+    qualifies, or either team's sample is too thin to trust. Checks
+    both directions independently; a match can fire for one side,
+    both, or neither.
     """
     if (
         (home_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
@@ -118,40 +128,60 @@ def evaluate_over_under_signal(home, away, home_data, away_data, m_url):
     ):
         return None
 
-    expected_home, expected_away, basis = _expected_goals(home_data, away_data)
-    expected_total = expected_home + expected_away
+    findings = []
 
-    qualifying = []
-    for line in GOAL_LINES:
-        # line is always X.5, so P(under) + P(over) == 1 exactly —
-        # no push to account for.
-        floor_goals = int(line)
-        p_under = _poisson_cdf(floor_goals, expected_total)
-        p_over = 1 - p_under
+    if _is_strong_attack(home_data) and _is_weak_defense(away_data):
+        score = _mismatch_score(home_data, away_data)
+        if score >= MISMATCH_SCORE_THRESHOLD:
+            findings.append(("home", score))
 
-        if p_over >= ALERT_PROBABILITY_THRESHOLD:
-            qualifying.append(("Over", line, p_over))
-        elif p_under >= ALERT_PROBABILITY_THRESHOLD:
-            qualifying.append(("Under", line, p_under))
+    if _is_strong_attack(away_data) and _is_weak_defense(home_data):
+        score = _mismatch_score(away_data, home_data)
+        if score >= MISMATCH_SCORE_THRESHOLD:
+            findings.append(("away", score))
 
-    if not qualifying:
+    if not findings:
         return None
-
-    qualifying.sort(key=lambda x: x[2], reverse=True)
 
     home_esc = _escape_markdown(home)
     away_esc = _escape_markdown(away)
 
-    lines = [
-        f"🎯 *{home_esc} vs {away_esc}*",
-        f"Goals model ({basis}): expected {expected_home:.2f} + "
-        f"{expected_away:.2f} = {expected_total:.2f} total",
-        "",
-        "📊 *Qualifying Over/Under signals*",
-    ]
-    for side, line, prob in qualifying:
-        lines.append(f"   {side} {line} — {prob*100:.1f}% probability")
-    lines.append("")
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
+    lines = [f"🎯 *{home_esc} vs {away_esc}*", ""]
+
+    for side, score in findings:
+        attacker_data = home_data if side == "home" else away_data
+        defender_data = away_data if side == "home" else home_data
+        attacker_name = home_esc if side == "home" else away_esc
+        defender_name = away_esc if side == "home" else home_esc
+
+        attack_rate = attacker_data.get("avg_xg")
+        if attack_rate is None:
+            attack_rate = attacker_data.get("avg_goals")
+        defense_rate = defender_data.get("avg_xga")
+        if defense_rate is None:
+            defense_rate = defender_data.get("avg_gc")
+
+        lines.append(
+            f"⚔️ *{attacker_name}'s attack vs {defender_name}'s defense* "
+            f"(mismatch score {score}/3)"
+        )
+        lines.append(
+            f"   {attacker_name} scoring {fmt(attack_rate)}/game vs "
+            f"{defender_name} conceding {fmt(defense_rate)}/game"
+        )
+        lines.append(
+            f"   Shots {fmt(attacker_data.get('avg_shots_for'))} for vs "
+            f"{fmt(defender_data.get('avg_shots_against'))} allowed | "
+            f"On target {fmt(attacker_data.get('avg_sot_for'))} vs "
+            f"{fmt(defender_data.get('avg_sot_against'))} | "
+            f"Big chances {fmt(attacker_data.get('avg_big_chances_for'))} vs "
+            f"{fmt(defender_data.get('avg_big_chances_against'))}"
+        )
+        lines.append("")
+
     lines.append(f"🔗 {m_url}")
 
     return "\n".join(lines)
@@ -713,12 +743,12 @@ def main():
                     log.error(f"Away team analysis failed: {e}")
                     away_data = None
 
-                ou_msg = evaluate_over_under_signal(home, away, home_data, away_data, m_url)
-                if not ou_msg:
-                    log.info("No qualifying Over/Under signal — not alerting.")
+                avd_msg = evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url)
+                if not avd_msg:
+                    log.info("No attack-vs-defense mismatch — not alerting.")
                     continue
 
-                msg = ou_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
+                msg = avd_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
                 log.info("MATCH STATS:\n" + msg)
                 scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
                 sent_count += 1
