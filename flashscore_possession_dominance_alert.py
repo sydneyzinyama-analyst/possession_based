@@ -64,10 +64,12 @@ MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
 # tunable style.
 ALERT_PROBABILITY_THRESHOLD = float(os.getenv("ALERT_PROBABILITY_THRESHOLD", "0.90"))
 
-# The fixed line this signal checks — Under 3.5 goals, per explicit
-# request. (Not the same GOAL_LINES-sweep shape as the earlier,
-# removed Over/Under model; this one only ever checks this one line.)
-GOAL_LINE = 3.5
+# The Under lines this signal checks, per explicit request. A match
+# alerts once if ANY line clears ALERT_PROBABILITY_THRESHOLD, and the
+# message lists every line that does. Any match clearing 3.5 also
+# clears 4.5, so 4.5 adds matches with a bit more expected goals
+# (~2.43 combined vs ~1.74 for 3.5 at the 90% bar).
+GOAL_LINES = [3.5, 4.5]
 
 
 def _expected_goals(home_data, away_data):
@@ -105,12 +107,12 @@ def _prob_under(expected_total, line):
     return _poisson_cdf(int(line), expected_total)
 
 
-def evaluate_under_3_5_signal(home, away, home_data, away_data, m_url):
+def evaluate_under_signal(home, away, home_data, away_data, m_url):
     """
     Returns a Telegram-ready message if this match's combined-goals
-    Poisson model puts P(Under 3.5) at or above
-    ALERT_PROBABILITY_THRESHOLD, or None if it doesn't (or either
-    team's sample is too thin to trust).
+    Poisson model puts P(Under line) at or above
+    ALERT_PROBABILITY_THRESHOLD for any line in GOAL_LINES, or None if
+    none do (or either team's sample is too thin to trust).
     """
     if (
         (home_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
@@ -120,9 +122,14 @@ def evaluate_under_3_5_signal(home, away, home_data, away_data, m_url):
 
     expected_home, expected_away, basis = _expected_goals(home_data, away_data)
     expected_total = expected_home + expected_away
-    p_under = _prob_under(expected_total, GOAL_LINE)
+    passing = [
+        (line, p)
+        for line in GOAL_LINES
+        for p in [_prob_under(expected_total, line)]
+        if p >= ALERT_PROBABILITY_THRESHOLD
+    ]
 
-    if p_under < ALERT_PROBABILITY_THRESHOLD:
+    if not passing:
         return None
 
     home_esc = _escape_markdown(home)
@@ -133,7 +140,12 @@ def evaluate_under_3_5_signal(home, away, home_data, away_data, m_url):
         f"Goals model ({basis}): expected {expected_home:.2f} + "
         f"{expected_away:.2f} = {expected_total:.2f} total",
         "",
-        f"📊 *Under {GOAL_LINE} goals — {p_under*100:.1f}% probability*",
+    ]
+    lines += [
+        f"📊 *Under {line} goals — {p*100:.1f}% probability*"
+        for line, p in passing
+    ]
+    lines += [
         "",
         f"🔗 {m_url}",
     ]
@@ -697,12 +709,12 @@ def main():
                     log.error(f"Away team analysis failed: {e}")
                     away_data = None
 
-                u35_msg = evaluate_under_3_5_signal(home, away, home_data, away_data, m_url)
-                if not u35_msg:
-                    log.info("No Under 3.5 signal — not alerting.")
+                under_msg = evaluate_under_signal(home, away, home_data, away_data, m_url)
+                if not under_msg:
+                    log.info("No Under 3.5/4.5 signal — not alerting.")
                     continue
 
-                msg = u35_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
+                msg = under_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
                 log.info("MATCH STATS:\n" + msg)
                 scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
                 sent_count += 1
