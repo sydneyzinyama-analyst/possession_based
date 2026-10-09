@@ -153,6 +153,151 @@ def evaluate_under_signal(home, away, home_data, away_data, m_url):
     return "\n".join(lines)
 
 
+# ---------------- STRONG ATTACK vs WEAK DEFENSE SIGNAL ----------------
+# Alerts when one side's own attacking record is genuinely strong AND
+# the side they're facing has a genuinely leaky defensive record — a
+# flagged matchup mismatch, not a predicted scoreline or probability.
+# Uses each side's OWN rate independently (not blended with the
+# opponent's, unlike the Under signal above) — "strong attack" and
+# "weak defense" are properties of a team's own record, not something
+# that depends on who they're facing.
+#
+# xG/xGA preferred over raw goals/conceded when available — steadier
+# match-to-match than actual goals, which swings more on finishing
+# variance, same xG-preferred pattern flashscore_scraper.py uses.
+#
+# NOTE: these thresholds are a reasonable starting point (a team
+# netting ~2/game is a clear attacking threat; a team shipping ~1.5+/
+# game has a real defensive problem), but — same lesson as every
+# other filter built in this file's history — they haven't been
+# checked against real results yet. Worth backtesting
+# (match_stats_backtest.py) before trusting them as-is.
+
+STRONG_ATTACK_GOALS = 2.0
+WEAK_DEFENSE_GOALS = 1.5
+
+# Corroboration bar: how many of the extra attack/defense indicators
+# (shots, shots on target, big chances — attacker's own rate for vs
+# defender's own rate against) have to agree before this fires, out
+# of 3 possible. Guards against a mismatch built on a couple of fluky
+# high-scoring/leaky games rather than a genuine, repeated pattern.
+MISMATCH_SCORE_THRESHOLD = 2
+
+
+def _is_strong_attack(team_data):
+    """True if team_data's own scoring rate (xG preferred over goals) clears STRONG_ATTACK_GOALS."""
+    rate = team_data.get("avg_xg")
+    if rate is None:
+        rate = team_data.get("avg_goals")
+    return rate is not None and rate >= STRONG_ATTACK_GOALS
+
+
+def _is_weak_defense(team_data):
+    """True if team_data's own conceding rate (xGA preferred over goals conceded) clears WEAK_DEFENSE_GOALS."""
+    rate = team_data.get("avg_xga")
+    if rate is None:
+        rate = team_data.get("avg_gc")
+    return rate is not None and rate >= WEAK_DEFENSE_GOALS
+
+
+def _mismatch_score(attacker_data, defender_data):
+    """
+    Corroboration on top of the hard gate: for each of shots/shots-on-
+    target/big-chances, does the attacker create a lot of them AND
+    does the defender concede a lot of them — 0 to 3. None-safe; a
+    missing stat contributes nothing.
+    """
+    score = 0
+    # (attacker's own "for" stat, defender's own "against" stat, bar both must clear)
+    checks = (
+        ("avg_shots_for", "avg_shots_against", 12.0),
+        ("avg_sot_for", "avg_sot_against", 4.5),
+        ("avg_big_chances_for", "avg_big_chances_against", 2.0),
+    )
+    for for_key, against_key, bar in checks:
+        attacker_rate = attacker_data.get(for_key)
+        defender_rate = defender_data.get(against_key)
+        if attacker_rate is not None and defender_rate is not None:
+            if attacker_rate >= bar and defender_rate >= bar:
+                score += 1
+    return score
+
+
+def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
+    """
+    Returns a Telegram-ready message if either side's strong attacking
+    record is facing the other side's weak defensive record,
+    corroborated by at least MISMATCH_SCORE_THRESHOLD of the shots/
+    SoT/big-chances indicators — or None if neither direction
+    qualifies, or either team's sample is too thin to trust. Checks
+    both directions independently; a match can fire for one side,
+    both, or neither.
+    """
+    if (
+        (home_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
+        or (away_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
+    ):
+        return None
+
+    findings = []
+
+    if _is_strong_attack(home_data) and _is_weak_defense(away_data):
+        score = _mismatch_score(home_data, away_data)
+        if score >= MISMATCH_SCORE_THRESHOLD:
+            findings.append(("home", score))
+
+    if _is_strong_attack(away_data) and _is_weak_defense(home_data):
+        score = _mismatch_score(away_data, home_data)
+        if score >= MISMATCH_SCORE_THRESHOLD:
+            findings.append(("away", score))
+
+    if not findings:
+        return None
+
+    home_esc = _escape_markdown(home)
+    away_esc = _escape_markdown(away)
+
+    def fmt(v):
+        return "N/A" if v is None else str(v)
+
+    lines = [f"⚔️ *{home_esc} vs {away_esc}*", ""]
+
+    for side, score in findings:
+        attacker_data = home_data if side == "home" else away_data
+        defender_data = away_data if side == "home" else home_data
+        attacker_name = home_esc if side == "home" else away_esc
+        defender_name = away_esc if side == "home" else home_esc
+
+        attack_rate = attacker_data.get("avg_xg")
+        if attack_rate is None:
+            attack_rate = attacker_data.get("avg_goals")
+        defense_rate = defender_data.get("avg_xga")
+        if defense_rate is None:
+            defense_rate = defender_data.get("avg_gc")
+
+        lines.append(
+            f"*{attacker_name}'s attack vs {defender_name}'s defense* "
+            f"(mismatch score {score}/3)"
+        )
+        lines.append(
+            f"   {attacker_name} scoring {fmt(attack_rate)}/game vs "
+            f"{defender_name} conceding {fmt(defense_rate)}/game"
+        )
+        lines.append(
+            f"   Shots {fmt(attacker_data.get('avg_shots_for'))} for vs "
+            f"{fmt(defender_data.get('avg_shots_against'))} allowed | "
+            f"On target {fmt(attacker_data.get('avg_sot_for'))} vs "
+            f"{fmt(defender_data.get('avg_sot_against'))} | "
+            f"Big chances {fmt(attacker_data.get('avg_big_chances_for'))} vs "
+            f"{fmt(defender_data.get('avg_big_chances_against'))}"
+        )
+        lines.append("")
+
+    lines.append(f"🔗 {m_url}")
+
+    return "\n".join(lines)
+
+
 # ---------------- JOB STATUS TELEGRAM ----------------
 def send_job_status(message, bot_token, chat_id):
     try:
@@ -709,15 +854,29 @@ def main():
                     log.error(f"Away team analysis failed: {e}")
                     away_data = None
 
+                # Independent signals — either, both, or neither can
+                # fire for a given match; each gets its own alert.
                 under_msg = evaluate_under_signal(home, away, home_data, away_data, m_url)
-                if not under_msg:
-                    log.info("No Under 3.5/4.5 signal — not alerting.")
-                    continue
+                avd_msg = evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url)
 
-                msg = under_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
-                log.info("MATCH STATS:\n" + msg)
-                scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
-                sent_count += 1
+                fired_signals = [
+                    ("under 3.5/4.5", under_msg),
+                    ("attack vs defense", avd_msg),
+                ]
+
+                any_fired = False
+                for label, sig_msg in fired_signals:
+                    if not sig_msg:
+                        continue
+                    any_fired = True
+                    msg = sig_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
+                    log.info(f"MATCH STATS ({label}):\n" + msg)
+                    scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
+                    sent_count += 1
+
+                if not any_fired:
+                    log.info("No signals — not alerting.")
+                    continue
 
             except Exception as match_err:
                 log.error(f"Error processing match {m_url}: {match_err}")
