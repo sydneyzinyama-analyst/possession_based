@@ -2,7 +2,6 @@ import os
 import sys
 import argparse
 import logging
-import math
 import time
 import re
 import traceback
@@ -41,116 +40,9 @@ TEAM_SAMPLE_MATCHES = 6
 # script sends one message for every match, pace the sends.
 TELEGRAM_SEND_INTERVAL_SEC = float(os.getenv("TELEGRAM_SEND_INTERVAL_SEC", "1.1"))
 
-# ---------------- MATCH UNDER 3.5 GOALS SIGNAL ----------------
-# Deterministic math, not a judgment call: both teams' expected goals
-# (see _expected_goals) are summed into one match-total rate, which
-# feeds a Poisson model's P(total <= 3) — the Poisson CDF at k=3 is
-# exactly P(Under 3.5), since 3.5 sits between the integers 3 and 4
-# with no push case to worry about.
-#
-# NOTE: a calculated 90% doesn't guarantee it's *right* 90% of the
-# time, only that the Poisson math was done correctly on the inputs it
-# was given — this file's history already has two prior filters that
-# looked reasonable and were swapped out (an Over/Under Poisson model
-# across several lines, then a team-to-score-1+ signal, then a
-# strong-attack-vs-weak-defense matchup filter before that); this one
-# needs the same real-result check (match_stats_backtest.py) before
-# the ALERT_PROBABILITY_THRESHOLD bar can be trusted as-is.
-
+# Both teams need a full sample of finished matches before the
+# signal below will judge them.
 MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
-
-# Only alert when the match's P(Under 3.5) clears this bar. 0.90 = 90%,
-# per explicit request. Env-overridable, matching this file's existing
-# tunable style.
-ALERT_PROBABILITY_THRESHOLD = float(os.getenv("ALERT_PROBABILITY_THRESHOLD", "0.90"))
-
-# The Under lines this signal checks, per explicit request. A match
-# alerts once if ANY line clears ALERT_PROBABILITY_THRESHOLD, and the
-# message lists every line that does. Any match clearing 3.5 also
-# clears 4.5, so 4.5 adds matches with a bit more expected goals
-# (~2.43 combined vs ~1.74 for 3.5 at the 90% bar).
-GOAL_LINES = [3.5, 4.5]
-
-
-def _expected_goals(home_data, away_data):
-    """
-    Each side's expected goals for this match: own attacking rate
-    blended with the opponent's own defensive leakiness (xG-based when
-    both teams have xG data, goals-based fallback otherwise) — the
-    same "for + opponent's against" blend flashscore_scraper.py uses
-    throughout its signal engine. Returns
-    (expected_home_goals, expected_away_goals, basis).
-    """
-    h_xg, h_xga = home_data.get("avg_xg"), home_data.get("avg_xga")
-    a_xg, a_xga = away_data.get("avg_xg"), away_data.get("avg_xga")
-
-    if None not in (h_xg, h_xga, a_xg, a_xga):
-        return (h_xg + a_xga) / 2, (a_xg + h_xga) / 2, "xG-based"
-
-    h_g, h_gc = home_data.get("avg_goals") or 0, home_data.get("avg_gc") or 0
-    a_g, a_gc = away_data.get("avg_goals") or 0, away_data.get("avg_gc") or 0
-    return (h_g + a_gc) / 2, (a_g + h_gc) / 2, "goals-based, no xG data"
-
-
-def _poisson_pmf(k, lam):
-    """P(exactly k) for a Poisson(lam) variable. Pure math.exp/factorial — no numpy needed."""
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
-
-
-def _poisson_cdf(k, lam):
-    """P(X <= k) for a Poisson(lam) variable, by summing the PMF up to k."""
-    return sum(_poisson_pmf(i, lam) for i in range(k + 1))
-
-
-def _prob_under(expected_total, line):
-    """P(Under `line`) for a Poisson(expected_total) match-total — line is always X.5, so this is exact (no push)."""
-    return _poisson_cdf(int(line), expected_total)
-
-
-def evaluate_under_signal(home, away, home_data, away_data, m_url):
-    """
-    Returns a Telegram-ready message if this match's combined-goals
-    Poisson model puts P(Under line) at or above
-    ALERT_PROBABILITY_THRESHOLD for any line in GOAL_LINES, or None if
-    none do (or either team's sample is too thin to trust).
-    """
-    if (
-        (home_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
-        or (away_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
-    ):
-        return None
-
-    expected_home, expected_away, basis = _expected_goals(home_data, away_data)
-    expected_total = expected_home + expected_away
-    passing = [
-        (line, p)
-        for line in GOAL_LINES
-        for p in [_prob_under(expected_total, line)]
-        if p >= ALERT_PROBABILITY_THRESHOLD
-    ]
-
-    if not passing:
-        return None
-
-    home_esc = _escape_markdown(home)
-    away_esc = _escape_markdown(away)
-
-    lines = [
-        f"🎯 *{home_esc} vs {away_esc}*",
-        f"Goals model ({basis}): expected {expected_home:.2f} + "
-        f"{expected_away:.2f} = {expected_total:.2f} total",
-        "",
-    ]
-    lines += [
-        f"📊 *Under {line} goals — {p*100:.1f}% probability*"
-        for line, p in passing
-    ]
-    lines += [
-        "",
-        f"🔗 {m_url}",
-    ]
-
-    return "\n".join(lines)
 
 
 # ---------------- STRONG ATTACK vs WEAK DEFENSE SIGNAL ----------------
@@ -158,7 +50,7 @@ def evaluate_under_signal(home, away, home_data, away_data, m_url):
 # the side they're facing has a genuinely leaky defensive record — a
 # flagged matchup mismatch, not a predicted scoreline or probability.
 # Uses each side's OWN rate independently (not blended with the
-# opponent's, unlike the Under signal above) — "strong attack" and
+# opponent's) — "strong attack" and
 # "weak defense" are properties of a team's own record, not something
 # that depends on who they're facing.
 #
@@ -176,6 +68,12 @@ def evaluate_under_signal(home, away, home_data, away_data, m_url):
 STRONG_ATTACK_GOALS = 2.0
 WEAK_DEFENSE_GOALS = 1.5
 
+# The attacking side must also be solid at the back itself — a strong
+# attack paired with its own leaky defense is just an open game, not a
+# one-sided mismatch. Attacker's own conceding rate (xGA preferred over
+# goals conceded) must be at or below this.
+GOOD_DEFENSE_GOALS = 1.0
+
 # Corroboration bar: how many of the extra attack/defense indicators
 # (shots, shots on target, big chances — attacker's own rate for vs
 # defender's own rate against) have to agree before this fires, out
@@ -192,12 +90,29 @@ def _is_strong_attack(team_data):
     return rate is not None and rate >= STRONG_ATTACK_GOALS
 
 
-def _is_weak_defense(team_data):
-    """True if team_data's own conceding rate (xGA preferred over goals conceded) clears WEAK_DEFENSE_GOALS."""
+def _conceding_rate(team_data):
+    """team_data's own conceding rate — xGA preferred over goals conceded."""
     rate = team_data.get("avg_xga")
     if rate is None:
         rate = team_data.get("avg_gc")
+    return rate
+
+
+def _is_weak_defense(team_data):
+    """True if team_data's own conceding rate clears WEAK_DEFENSE_GOALS."""
+    rate = _conceding_rate(team_data)
     return rate is not None and rate >= WEAK_DEFENSE_GOALS
+
+
+def _is_good_defense(team_data):
+    """True if team_data's own conceding rate is at or below GOOD_DEFENSE_GOALS."""
+    rate = _conceding_rate(team_data)
+    return rate is not None and rate <= GOOD_DEFENSE_GOALS
+
+
+def _is_complete_team(team_data):
+    """Strong attack AND good defense — the attacking side this signal wants."""
+    return _is_strong_attack(team_data) and _is_good_defense(team_data)
 
 
 def _mismatch_score(attacker_data, defender_data):
@@ -226,7 +141,8 @@ def _mismatch_score(attacker_data, defender_data):
 def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
     """
     Returns a Telegram-ready message if either side's strong attacking
-    record is facing the other side's weak defensive record,
+    record (backed by its own good defensive record) is facing the
+    other side's weak defensive record,
     corroborated by at least MISMATCH_SCORE_THRESHOLD of the shots/
     SoT/big-chances indicators — or None if neither direction
     qualifies, or either team's sample is too thin to trust. Checks
@@ -241,12 +157,12 @@ def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
 
     findings = []
 
-    if _is_strong_attack(home_data) and _is_weak_defense(away_data):
+    if _is_complete_team(home_data) and _is_weak_defense(away_data):
         score = _mismatch_score(home_data, away_data)
         if score >= MISMATCH_SCORE_THRESHOLD:
             findings.append(("home", score))
 
-    if _is_strong_attack(away_data) and _is_weak_defense(home_data):
+    if _is_complete_team(away_data) and _is_weak_defense(home_data):
         score = _mismatch_score(away_data, home_data)
         if score >= MISMATCH_SCORE_THRESHOLD:
             findings.append(("away", score))
@@ -271,9 +187,8 @@ def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
         attack_rate = attacker_data.get("avg_xg")
         if attack_rate is None:
             attack_rate = attacker_data.get("avg_goals")
-        defense_rate = defender_data.get("avg_xga")
-        if defense_rate is None:
-            defense_rate = defender_data.get("avg_gc")
+        defense_rate = _conceding_rate(defender_data)
+        attacker_conceding = _conceding_rate(attacker_data)
 
         lines.append(
             f"*{attacker_name}'s attack vs {defender_name}'s defense* "
@@ -282,6 +197,10 @@ def evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url):
         lines.append(
             f"   {attacker_name} scoring {fmt(attack_rate)}/game vs "
             f"{defender_name} conceding {fmt(defense_rate)}/game"
+        )
+        lines.append(
+            f"   {attacker_name} solid at the back too: conceding "
+            f"{fmt(attacker_conceding)}/game"
         )
         lines.append(
             f"   Shots {fmt(attacker_data.get('avg_shots_for'))} for vs "
@@ -854,13 +773,9 @@ def main():
                     log.error(f"Away team analysis failed: {e}")
                     away_data = None
 
-                # Independent signals — either, both, or neither can
-                # fire for a given match; each gets its own alert.
-                under_msg = evaluate_under_signal(home, away, home_data, away_data, m_url)
                 avd_msg = evaluate_attack_vs_defense_signal(home, away, home_data, away_data, m_url)
 
                 fired_signals = [
-                    ("under 3.5/4.5", under_msg),
                     ("attack vs defense", avd_msg),
                 ]
 
