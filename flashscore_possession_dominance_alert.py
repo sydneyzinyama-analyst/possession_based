@@ -41,6 +41,62 @@ TEAM_SAMPLE_MATCHES = 6
 TELEGRAM_SEND_INTERVAL_SEC = float(os.getenv("TELEGRAM_SEND_INTERVAL_SEC", "1.1"))
 
 
+# ---------------- HOME EDGE SIGNAL ----------------
+# Alerts when the home side's own recent averages are ahead of the
+# away side's own recent averages in possession, goals AND shots — all
+# three, each by a noticeable gap. Not a "dominance" claim, just a
+# clear edge. Compares each team's own "for" averages directly (home's
+# possession vs away's possession, etc.).
+#
+# NOTE: these gaps are a reasonable starting point, not checked against
+# real results yet.
+
+# Both teams need a full sample of finished matches before the signal
+# will judge them.
+MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
+
+# Minimum gap (home avg minus away avg) for each stat.
+MIN_POSSESSION_GAP = 5.0   # percentage points
+MIN_GOALS_GAP = 0.4        # goals per game
+MIN_SHOTS_GAP = 3.0        # shots per game
+
+HOME_EDGE_STATS = (
+    ("Possession", "avg_possession", MIN_POSSESSION_GAP, "%"),
+    ("Goals", "avg_goals", MIN_GOALS_GAP, ""),
+    ("Shots", "avg_shots_for", MIN_SHOTS_GAP, ""),
+)
+
+
+def evaluate_home_edge_signal(home, away, home_data, away_data):
+    """
+    Returns a Telegram-ready header if the home side is ahead of the
+    away side by at least the minimum gap in every HOME_EDGE_STATS
+    stat, or None otherwise (including missing data or a thin sample).
+    """
+    if (
+        (home_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
+        or (away_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
+    ):
+        return None
+
+    rows = []
+    for label, key, min_gap, suffix in HOME_EDGE_STATS:
+        h, a = home_data.get(key), away_data.get(key)
+        if h is None or a is None or h - a < min_gap:
+            return None
+        rows.append(f"✅ {label}: {h:g}{suffix} vs {a:g}{suffix} (+{h - a:.1f})")
+
+    home_esc = _escape_markdown(home)
+    away_esc = _escape_markdown(away)
+
+    lines = [
+        f"🏠 *Home edge: {home_esc} ahead of {away_esc}*",
+        f"(own averages, last {TEAM_SAMPLE_MATCHES} matches)",
+    ]
+    lines += rows
+    return "\n".join(lines)
+
+
 # ---------------- JOB STATUS TELEGRAM ----------------
 def send_job_status(message, bot_token, chat_id):
     try:
@@ -597,8 +653,13 @@ def main():
                     log.error(f"Away team analysis failed: {e}")
                     away_data = None
 
-                msg = build_match_message(match, home_data, away_data, m_url)
-                log.info("MATCH STATS:\n" + msg)
+                edge_msg = evaluate_home_edge_signal(home, away, home_data, away_data)
+                if not edge_msg:
+                    log.info("No home edge — not alerting.")
+                    continue
+
+                msg = edge_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
+                log.info("MATCH STATS (home edge):\n" + msg)
                 scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
                 sent_count += 1
 
