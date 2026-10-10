@@ -40,181 +40,6 @@ TEAM_SAMPLE_MATCHES = 6
 # script sends one message for every match, pace the sends.
 TELEGRAM_SEND_INTERVAL_SEC = float(os.getenv("TELEGRAM_SEND_INTERVAL_SEC", "1.1"))
 
-# Both teams need a full sample of finished matches before the
-# signal below will judge them.
-MIN_SAMPLE_MATCHES = TEAM_SAMPLE_MATCHES
-
-
-# ---------------- HOME DOMINANCE (POSSESSION FIRST) SIGNAL ----------------
-# Home-team only. Claim: the home side will have the ball AND win the
-# rest of the stat sheet. Possession is the hard requirement — every
-# possession gate must pass on its own. The other stats (shots, shots
-# on target, xG, big chances, corners) are a corroboration score on
-# top: enough of them have to agree, but no single one is required,
-# since smaller leagues often lack xG/big-chances data.
-#
-# Each matchup stat is projected the same "own rate + opponent's
-# allowed rate" way: home's projected shots = average of home's own
-# shots-for and away's own shots-against, and likewise for the away
-# side — so it reflects this pairing, not either team in isolation.
-#
-# NOTE: these thresholds are a reasonable starting point, not checked
-# against real results yet — worth backtesting
-# (match_stats_backtest.py) before trusting them as-is.
-
-# --- Possession gates (ALL must pass) ---
-# Home side's own average possession.
-HOME_MIN_AVG_POSSESSION = 58.0
-# Away side's own average possession.
-AWAY_MAX_AVG_POSSESSION = 47.0
-# Consistency: in at least MIN_CONSISTENT_MATCHES of the sampled
-# matches, home had >= HOME_DOMINANT_MATCH_POSSESSION and away had
-# <= AWAY_CEDING_MATCH_POSSESSION — guards against one freak 80% game
-# dragging an average up.
-HOME_DOMINANT_MATCH_POSSESSION = 55.0
-AWAY_CEDING_MATCH_POSSESSION = 50.0
-MIN_CONSISTENT_MATCHES = 4
-# Blended projection: (home avg + (100 - away avg)) / 2.
-MIN_PROJECTED_HOME_POSSESSION = 58.0
-
-# --- Stat-sheet corroboration (score out of 5) ---
-# (label, "for" key, "against" key, how home's projection must compare
-# to away's: ("ratio", x) = home >= x * away, ("edge", x) = home - away >= x)
-DOMINANCE_STATS = (
-    ("Shots", "avg_shots_for", "avg_shots_against", ("ratio", 1.4)),
-    ("On target", "avg_sot_for", "avg_sot_against", ("ratio", 1.4)),
-    ("xG", "avg_xg", "avg_xga", ("edge", 0.4)),
-    ("Big chances", "avg_big_chances_for", "avg_big_chances_against", ("ratio", 1.4)),
-    ("Corners", "avg_corners_for", "avg_corners_against", ("ratio", 1.3)),
-)
-MIN_STATS_DOMINANCE_SCORE = 3
-
-
-def _projected(home_data, away_data, for_key, against_key):
-    """
-    (home projection, away projection) for one stat in this matchup,
-    or (None, None) if either side is missing the data.
-    """
-    h_for, h_against = home_data.get(for_key), home_data.get(against_key)
-    a_for, a_against = away_data.get(for_key), away_data.get(against_key)
-    if None in (h_for, h_against, a_for, a_against):
-        return None, None
-    return (h_for + a_against) / 2, (a_for + h_against) / 2
-
-
-def _stats_dominance(home_data, away_data):
-    """
-    Returns (score, rows): score = how many DOMINANCE_STATS home wins
-    by the required margin; rows = (label, home, away, passed) for
-    every stat, for the message. Missing data scores nothing.
-    """
-    score = 0
-    rows = []
-    for label, for_key, against_key, (kind, bar) in DOMINANCE_STATS:
-        h, a = _projected(home_data, away_data, for_key, against_key)
-        if h is None:
-            rows.append((label, None, None, False))
-            continue
-        if kind == "ratio":
-            passed = h >= bar * max(a, 0.1)
-        else:
-            passed = h - a >= bar
-        if passed:
-            score += 1
-        rows.append((label, h, a, passed))
-    return score, rows
-
-
-def evaluate_home_dominance_signal(home, away, home_data, away_data, m_url):
-    """
-    Returns a Telegram-ready message if the home side passes every
-    possession gate (average, per-match consistency, blended
-    projection) AND wins at least MIN_STATS_DOMINANCE_SCORE of the
-    DOMINANCE_STATS — or None otherwise, or if either team's sample is
-    too thin to trust.
-    """
-    if (
-        (home_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
-        or (away_data or {}).get("matches", 0) < MIN_SAMPLE_MATCHES
-    ):
-        return None
-
-    # --- Possession gates ---
-    home_poss = home_data.get("avg_possession")
-    away_poss = away_data.get("avg_possession")
-    if home_poss is None or away_poss is None:
-        return None
-    if home_poss < HOME_MIN_AVG_POSSESSION or away_poss > AWAY_MAX_AVG_POSSESSION:
-        return None
-
-    home_series = home_data.get("possession_series") or []
-    away_series = away_data.get("possession_series") or []
-    home_dominant = sum(1 for v in home_series if v >= HOME_DOMINANT_MATCH_POSSESSION)
-    away_ceding = sum(1 for v in away_series if v <= AWAY_CEDING_MATCH_POSSESSION)
-    if home_dominant < MIN_CONSISTENT_MATCHES or away_ceding < MIN_CONSISTENT_MATCHES:
-        return None
-
-    projected_poss = (home_poss + (100 - away_poss)) / 2
-    if projected_poss < MIN_PROJECTED_HOME_POSSESSION:
-        return None
-
-    # --- Stat-sheet corroboration ---
-    score, rows = _stats_dominance(home_data, away_data)
-    if score < MIN_STATS_DOMINANCE_SCORE:
-        return None
-
-    # --- Risk factors (shown, don't block) ---
-    risks = []
-    if home_series and max(home_series) - min(home_series) >= 20:
-        risks.append(
-            f"{home}'s possession swings a lot match to match "
-            f"({min(home_series):.0f}%–{max(home_series):.0f}%)"
-        )
-    away_goals = away_data.get("avg_goals")
-    if away_goals is not None and away_goals >= 1.3:
-        risks.append(
-            f"{away} scores well without the ball ({away_goals}/game on "
-            f"{away_poss}% possession) — dangerous on the counter"
-        )
-
-    # --- Message ---
-    home_esc = _escape_markdown(home)
-    away_esc = _escape_markdown(away)
-
-    def series(vals):
-        return " / ".join(f"{v:.0f}" for v in vals) or "N/A"
-
-    def num(v):
-        return "N/A" if v is None else f"{v:.1f}"
-
-    lines = [
-        f"🎮 *{home_esc} vs {away_esc}*",
-        "",
-        f"🎯 *{home_esc} (home) to dominate — projected ~{projected_poss:.0f}% possession*",
-        "",
-        "⚽ *Possession*",
-        f"{home_esc}: avg {home_poss:.1f}% | {home_dominant}/{len(home_series)} "
-        f"games ≥ {HOME_DOMINANT_MATCH_POSSESSION:.0f}%",
-        f"   last games: {series(home_series)}",
-        f"{away_esc}: avg {away_poss:.1f}% | {away_ceding}/{len(away_series)} "
-        f"games ≤ {AWAY_CEDING_MATCH_POSSESSION:.0f}%",
-        f"   last games: {series(away_series)}",
-        "",
-        f"📊 *Projected stats ({score}/{len(DOMINANCE_STATS)} won by {home_esc})*",
-    ]
-    for label, h, a, passed in rows:
-        mark = "✅" if passed else "▫️"
-        lines.append(f"{mark} {label}: {num(h)} vs {num(a)}")
-
-    if risks:
-        lines.append("")
-        lines.append(f"⚠️ *Risk factors ({len(risks)})*")
-        lines.extend(f"• {_escape_markdown(r)}" for r in risks)
-
-    lines += ["", f"🔗 {m_url}"]
-
-    return "\n".join(lines)
-
 
 # ---------------- JOB STATUS TELEGRAM ----------------
 def send_job_status(message, bot_token, chat_id):
@@ -503,23 +328,6 @@ class ThreeSixtyFiveScoresScraper:
 
         return round(total / counted, 2)
 
-    def _team_series(self, results, stat_name, team_id):
-        """
-        The team's own value of stat_name in each match that has one,
-        most recent first.
-        """
-        values = []
-        for r in results:
-            if r.get("home_id") == team_id:
-                v = r.get(f"home_{stat_name}")
-            elif r.get("away_id") == team_id:
-                v = r.get(f"away_{stat_name}")
-            else:
-                continue
-            if v is not None:
-                values.append(v)
-        return values
-
     def _team_form(self, results, team_id):
         """
         W/D/L string from the team's point of view, most recent first,
@@ -567,7 +375,6 @@ class ThreeSixtyFiveScoresScraper:
             "team_id": team_id,
             "matches": len(results),
             "form": self._team_form(results, team_id),
-            "possession_series": self._team_series(results, "possession", team_id),
             "avg_goals": avg("goals"),
             "avg_gc": avg("goals", "against"),
             "avg_xg": avg_xg,
@@ -790,25 +597,10 @@ def main():
                     log.error(f"Away team analysis failed: {e}")
                     away_data = None
 
-                dom_msg = evaluate_home_dominance_signal(home, away, home_data, away_data, m_url)
-
-                fired_signals = [
-                    ("home dominance", dom_msg),
-                ]
-
-                any_fired = False
-                for label, sig_msg in fired_signals:
-                    if not sig_msg:
-                        continue
-                    any_fired = True
-                    msg = sig_msg + "\n\n" + build_match_message(match, home_data, away_data, m_url)
-                    log.info(f"MATCH STATS ({label}):\n" + msg)
-                    scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
-                    sent_count += 1
-
-                if not any_fired:
-                    log.info("No signals — not alerting.")
-                    continue
+                msg = build_match_message(match, home_data, away_data, m_url)
+                log.info("MATCH STATS:\n" + msg)
+                scraper.send_telegram_message(msg, BOT_TOKEN, CHAT_ID)
+                sent_count += 1
 
             except Exception as match_err:
                 log.error(f"Error processing match {m_url}: {match_err}")
