@@ -1036,25 +1036,24 @@ class TennisScraper:
 
 
 # ---------------- TENNIS FAVORITE SIGNAL ----------------
-# BACKTESTED (see flashscore-app/tennis_backtest.py, same 365scores
-# data, same methodology): picking the winner by a from-scratch
-# 4-component score alone scored 45% on 29 real matches — worse than a
-# coin flip. A trivial baseline — just picking whoever has the better
-# OFFICIAL ATP/WTA ranking, a number 365scores already returns on
-# every match listing at zero extra API cost — scored 67.5% on 114
-# real matches the same day. A mature, season-long aggregate rating
-# beats a from-scratch composite built from a noisy 10-match snapshot.
+# BACKTESTED (same 365scores data, two independent weeks): requiring
+# the official ranking favorite to ALSO be ahead on literally every
+# one of the 7 measured signals below (form, surface fit, schedule
+# strength, and all 4 serve/return stats) — i.e. corroboration==7,
+# no partial credit, no confidence tiers — scored ~72% pooled across
+# both weeks, consistently better than baseline in each one
+# separately. That's the only bar this signal uses: outright better
+# in every department, or no alert at all.
 #
-# So: official ranking is what PICKS the winner (_rank_favorite). The
-# 0-100 component score below (form/surface/schedule) plus 4
-# individual serve/return stats are demoted to a corroboration layer
-# (_corroboration_score) that can only raise or lower CONFIDENCE in
-# that pick, never flip it — same "hard gate + corroboration" shape as
-# the football signal above, rather than several uncertain numbers
-# averaged as equals. Every function below is None/NaN-safe: real API
-# data is missing fields routinely (unranked opponents, Challenger
-# matches with no surface, stats endpoints with partial data), and
-# this fails closed (treats "unknown" as neutral, never as a crash).
+# Official ranking still picks WHO the favorite is (_rank_favorite) —
+# a mature, season-long aggregate beats a from-scratch composite
+# built from a noisy 10-match snapshot (a from-scratch score alone
+# scored 45% on 29 real matches, worse than a coin flip). The 7
+# signals below only ever confirm that pick; they can never flip it.
+# Every function is None/NaN-safe: real API data is missing fields
+# routinely (unranked opponents, Challenger matches with no surface,
+# stats endpoints with partial data), and this fails closed (treats
+# "unknown" as neutral, never as a crash).
 TENNIS_MIN_SAMPLE_MATCHES = 5
 
 WEIGHT_FORM = 0.30
@@ -1065,16 +1064,11 @@ WEIGHT_STATS = 0.25
 RECENT_MATCH_WEIGHT_MULTIPLIER = 1.5  # applied to the most recent matches
 RECENT_MATCH_COUNT = 3
 
-# Corroboration bar: how many of 7 signals have to agree with the
-# ranking favorite before this fires, and at what confidence — see
-# _corroboration_score. 3 are the Predictive Power Score's
-# form/surface/schedule components; 4 are individual serve/return
-# stats (first serve won%, second serve won%, return points won%,
-# break points won%) compared PLAYER-TO-PLAYER directly, rather than
-# blended into one "statistical dominance" number — a fine-grained
-# stat matchup, not a single blended figure. Out of 7 possible.
-TENNIS_CORROBORATION_HIGH_THRESHOLD = 5
-TENNIS_CORROBORATION_MEDIUM_THRESHOLD = 3
+# Out of 7 possible signals (3 Predictive Power Score components +
+# 4 individual serve/return stats — see _corroboration_score). This
+# fires only when ALL 7 agree with the ranking favorite; nothing
+# partial.
+TENNIS_CORROBORATION_REQUIRED = 7
 
 
 def _opponent_strength_multiplier(rank):
@@ -1260,29 +1254,20 @@ def _corroboration_score(favorite_result, underdog_result, favorite_stats, under
     return score
 
 
-def corroboration_confidence(score):
-    if score >= TENNIS_CORROBORATION_HIGH_THRESHOLD:
-        return "High"
-    if score >= TENNIS_CORROBORATION_MEDIUM_THRESHOLD:
-        return "Medium"
-    return "Low"
-
-
 def evaluate_tennis_favorite_signal(
     player_a, player_b, a_rank, b_rank, a_matches, b_matches, surface, m_url,
 ):
     """
     Picks the winner by official ranking (_rank_favorite) — validated
     at 67.5% on 114 real matches, see this section's header comment —
-    then uses 7 signals purely as corroboration to set confidence
-    (_corroboration_score): the Predictive Power Score's form/surface/
-    schedule components, plus 4 individual serve/return stats compared
-    player-to-player (_player_stat_averages) rather than blended into
-    one number. Returns None if either side lacks enough recent-match
-    data (TENNIS_MIN_SAMPLE_MATCHES, same "refuse to predict on too
-    little data" gate as the football signal above), if neither
-    player has a usable official ranking, or if confidence comes back
-    Low.
+    then only fires if that favorite is ALSO ahead on literally every
+    one of the 7 corroboration signals (_corroboration_score ==
+    TENNIS_CORROBORATION_REQUIRED) — outright better in every
+    department, no partial credit, no confidence tiers. Returns None
+    if either side lacks enough recent-match data
+    (TENNIS_MIN_SAMPLE_MATCHES, same "refuse to predict on too little
+    data" gate as the football signal above), if neither player has a
+    usable official ranking, or if the favorite isn't ahead on all 7.
     """
     if (
         len(a_matches) < TENNIS_MIN_SAMPLE_MATCHES
@@ -1313,9 +1298,8 @@ def evaluate_tennis_favorite_signal(
     corroboration = _corroboration_score(
         favorite_result, underdog_result, favorite_stats, underdog_stats,
     )
-    confidence = corroboration_confidence(corroboration)
 
-    if confidence == "Low":
+    if corroboration < TENNIS_CORROBORATION_REQUIRED:
         return None
 
     favorite_esc = _escape_markdown(favorite)
@@ -1325,13 +1309,12 @@ def evaluate_tennis_favorite_signal(
         return "N/A" if v is None else f"{v:.1f}"
 
     lines = [
-        f"🎾 *Tennis Favorite* ({confidence} confidence)",
+        f"🎾 *{favorite_esc} is statistically better than {underdog_esc} in every department*",
         f"{_escape_markdown(player_a)} vs {_escape_markdown(player_b)}"
         + (f" — {surface}" if surface else ""),
         "",
         f"*{favorite_esc}* (rank {favorite_rank}) to beat "
         f"{underdog_esc} (rank {underdog_rank})",
-        f"Corroboration: {corroboration}/7 signals favor {favorite_esc}",
         f"Form {favorite_result['form_momentum']:.1f} vs {underdog_result['form_momentum']:.1f} · "
         f"Surface {favorite_result['surface_compatibility']:.1f} vs {underdog_result['surface_compatibility']:.1f} · "
         f"Schedule {favorite_result['strength_of_schedule']:.1f} vs {underdog_result['strength_of_schedule']:.1f}",
