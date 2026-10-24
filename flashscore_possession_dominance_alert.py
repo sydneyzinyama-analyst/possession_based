@@ -50,6 +50,8 @@ TELEGRAM_SEND_INTERVAL_SEC = float(os.getenv("TELEGRAM_SEND_INTERVAL_SEC", "1.1"
 #      MIN_SHOTS_GAP higher than the away team's
 #   4. Home team defends well: it concedes less than
 #      HOME_MAX_GOALS_AGAINST goals per game
+#   5. Home team's possession is at least MIN_POSSESSION_GAP
+#      percentage points higher than the away team's
 #
 # NOTE: these thresholds are a reasonable starting point, not checked
 # against real results yet.
@@ -62,6 +64,7 @@ HOME_MIN_GOALS_FOR = 2.0       # home avg goals scored must be ABOVE this
 AWAY_MAX_GOALS_FOR = 1.0       # away avg goals scored must be BELOW this
 MIN_SHOTS_GAP = 3.0            # home shots/game minus away shots/game
 HOME_MAX_GOALS_AGAINST = 1.0   # home avg goals conceded must be BELOW this
+MIN_POSSESSION_GAP = 5.0       # home possession minus away possession (pct points)
 
 
 def evaluate_home_edge_signal(home, away, home_data, away_data):
@@ -81,8 +84,13 @@ def evaluate_home_edge_signal(home, away, home_data, away_data):
     home_shots = home_data.get("avg_shots_for")
     away_shots = away_data.get("avg_shots_for")
     home_conceded = home_data.get("avg_gc")
+    home_poss = home_data.get("avg_possession")
+    away_poss = away_data.get("avg_possession")
 
-    if None in (home_goals, away_goals, home_shots, away_shots, home_conceded):
+    if None in (
+        home_goals, away_goals, home_shots, away_shots, home_conceded,
+        home_poss, away_poss,
+    ):
         return None
 
     if home_goals <= HOME_MIN_GOALS_FOR:
@@ -92,6 +100,8 @@ def evaluate_home_edge_signal(home, away, home_data, away_data):
     if home_shots - away_shots < MIN_SHOTS_GAP:
         return None
     if home_conceded >= HOME_MAX_GOALS_AGAINST:
+        return None
+    if home_poss - away_poss < MIN_POSSESSION_GAP:
         return None
 
     home_esc = _escape_markdown(home)
@@ -104,6 +114,7 @@ def evaluate_home_edge_signal(home, away, home_data, away_data):
         f"✅ Away scoring: {away_goals:g} per game (< {AWAY_MAX_GOALS_FOR:g})",
         f"✅ Shots: {home_shots:g} vs {away_shots:g} (+{home_shots - away_shots:.1f})",
         f"✅ Home defence: {home_conceded:g} conceded per game (< {HOME_MAX_GOALS_AGAINST:g})",
+        f"✅ Possession: {home_poss:g}% vs {away_poss:g}% (+{home_poss - away_poss:.1f})",
     ]
     return "\n".join(lines)
 
